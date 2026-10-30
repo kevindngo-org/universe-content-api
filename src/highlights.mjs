@@ -11,3 +11,4 @@ export function loadHighlights(url = DATA_URL) {
         highlights: highlights.map((item) => ({ id: slugify(item.title), ...item })),
     };
 }
+// throwaway
