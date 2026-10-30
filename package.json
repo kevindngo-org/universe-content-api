@@ -1,0 +1,13 @@
+{
+  "name": "universe-content-api",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Read-only content API for the GitHub Universe '26 landing page (kevindngo-org/virtual-universe-26).",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "demo:remote-reset": "node demo/remote-reset.mjs"
+  }
+}
