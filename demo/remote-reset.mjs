@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 export const REPO = "kevindngo-org/universe-content-api";
 const ROOT = fileURLToPath(new URL("../", import.meta.url));
@@ -24,18 +25,64 @@ function api(path, method = "GET", body) {
     return output ? JSON.parse(output) : null;
 }
 
-function pages(path) {
-    return JSON.parse(run("gh", ["api", "--paginate", "--slurp", path])).flat();
+export function pages(path, command = run) {
+    const result = JSON.parse(command("gh", ["api", "--paginate", "--slurp", path]));
+    if (!Array.isArray(result) || !result.every(Array.isArray)) {
+        throw new Error(`Invalid paginated list response at ${path}; refusing an incomplete snapshot.`);
+    }
+    return result.flat();
 }
 
-// This repo may not have CodeQL or Dependabot alerts enabled; treat that as "no alerts".
-function optionalPages(path) {
+export function alertPages(path, read = pages) {
     try {
-        return pages(path);
+        return read(path);
     } catch (error) {
-        if (/HTTP (403|404)/.test(String(error.stderr))) return [];
-        throw error;
+        throw new Error(`Cannot inspect alerts at ${path}; check alert access and feature availability. ` +
+            `Refusing an incomplete reset: ${String(error.stderr || error.message).trim()}`, { cause: error });
     }
+}
+
+export function collectAlerts(kind, read = pages) {
+    const first = collectAlertSweep(kind, read);
+    const second = collectAlertSweep(kind, read);
+    if (!equal(first, second)) throw new Error(`Changed ${kind} alert inventory between complete sweeps; preview again after stopping writers.`);
+    return second;
+}
+
+function alertState(alert) {
+    return {
+        number: alert.number, id: alert.id ?? null, node_id: alert.node_id ?? null, state: alert.state,
+        assignees: (alert.assignees || []).map(({ login }) => ({ login }))
+            .sort((a, b) => compareText(a.login, b.login)),
+        updated_at: alert.updated_at ?? null,
+    };
+}
+
+function collectAlertSweep(kind, read) {
+    const states = kind === "code-scanning" ? ["open", "closed", "dismissed", "fixed"] :
+        kind === "dependabot" ? ["open", "dismissed", "fixed", "auto_dismissed"] : undefined;
+    if (!states) throw new Error(`Unsupported alert kind: ${kind}`);
+    const found = new Map();
+    for (const state of states) {
+        const path = `repos/${REPO}/${kind}/alerts?state=${state}&per_page=100`;
+        const alerts = alertPages(path, read);
+        if (!Array.isArray(alerts)) throw new Error(`Invalid alert list at ${path}.`);
+        for (const alert of alerts) {
+            const allowed = kind === "code-scanning" && state === "closed" ? ["closed", "dismissed", "fixed"] : [state];
+            if (!Number.isSafeInteger(alert.number) || alert.number < 1 || !allowed.includes(alert.state) ||
+                (alert.assignees !== undefined && (!Array.isArray(alert.assignees) ||
+                    !alert.assignees.every((a) => typeof a.login === "string")))) {
+                throw new Error(`Invalid or inconsistent ${kind} alert in ${state} response; preview again after stopping writers.`);
+            }
+            const normalized = alertState(alert);
+            const prior = found.get(alert.number);
+            if (prior && !equal(prior, normalized)) {
+                throw new Error(`Inconsistent ${kind} alert #${alert.number} across observations; preview again after stopping writers.`);
+            }
+            found.set(alert.number, normalized);
+        }
+    }
+    return [...found.values()].sort(byNumber);
 }
 
 export function validateState(state) {
@@ -61,116 +108,425 @@ export function validateState(state) {
             throw new Error("Invalid seeded issue or assignees.");
         }
     }
+    if (new Set(state.prs.map((pr) => pr.number)).size !== state.prs.length ||
+        new Set(state.prs.map((pr) => pr.head)).size !== state.prs.length ||
+        new Set(state.issues.map((issue) => issue.number)).size !== state.issues.length) {
+        throw new Error("Duplicate prepared PR identity/head or seeded issue in baseline.");
+    }
 }
 
-const samePR = (pr, seed, repo) =>
-    pr.head.repo?.full_name === repo && pr.head.ref === seed.head && pr.base.ref === seed.base;
+const ZERO = "0".repeat(40);
+const UPDATE_REFS = "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }";
+const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+const byNumber = (a, b) => a.number - b.number;
+const sortedEntries = (object) => Object.entries(object).sort(([a], [b]) => compareText(a, b));
+const branchPath = (name) => name.split("/").map(encodeURIComponent).join("/");
+const headMatches = (pr, seed) => pr.head.repo?.full_name === REPO && pr.head.ref === seed.head;
+const reviewed = (pr) => Boolean(pr.reviews?.length || pr.reviewComments?.length);
+const labelNames = (pr) => pr.labels.map((label) => label.name).sort();
+const equal = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+const RECEIPT_TITLE = "Demo reset replacement receipt";
+const identity = (user) => ({ id: user?.id, login: user?.login });
+const validUser = (user) => Number.isSafeInteger(user?.id) && user.id > 0 && typeof user.login === "string" && user.login.length > 0;
+const receiptBody = (receipt) => `${RECEIPT_TITLE}\n\n\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\``;
+function replacementMatches(pr, seed, sha, original) {
+    if (!headMatches(pr, seed) || pr.number <= seed.number) return false;
+    return original.issueComments.some((comment) => {
+        if (!comment.body.startsWith(`${RECEIPT_TITLE}\n\n\`\`\`json\n`)) return false;
+        let receipt;
+        try {
+            receipt = JSON.parse(comment.body.slice(`${RECEIPT_TITLE}\n\n\`\`\`json\n`.length, -4));
+        } catch {
+            return false;
+        }
+        return comment.body === receiptBody(receipt) && equal(receipt, {
+            version: 1, repo: REPO, originalNumber: seed.number,
+            replacementNumber: pr.number, replacementNodeId: pr.node_id,
+            seededHead: { ref: seed.head, sha }, creator: identity(pr.user),
+        }) && equal(identity(comment.user), identity(pr.user));
+    });
+}
+const prGuard = (pr, sha = pr.head.sha) => ({
+    number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
+    head: pr.head.ref, repo: pr.head.repo?.full_name ?? null, sha,
+    state: pr.state, merged_at: pr.merged_at ?? null, title: pr.title, body: pr.body || "",
+    base: pr.base.ref, baseSha: pr.base.sha, draft: pr.draft, labels: labelNames(pr),
+    reviews: pr.reviews.map(({ id, state, body, commit_id, submitted_at }) =>
+        canonical({ id, state, body, commit_id, submitted_at })).sort((a, b) => a.id - b.id),
+    reviewComments: pr.reviewComments.map(({ id, body, updated_at, commit_id }) =>
+        canonical({ id, body, updated_at, commit_id })).sort((a, b) => a.id - b.id),
+    issueComments: pr.issueComments.map(({ id, body, user, updated_at }) =>
+        canonical({ id, body, user: identity(user), updated_at })).sort((a, b) => a.id - b.id),
+});
+const requestAction = (label, path, method, body, guard) => ({
+    kind: "request", label, path, method, body, ...(guard ? { guard } : {}),
+});
+
+function metadataActions(seed, pr, sha, baseSha, full = false) {
+    const prefix = `repos/${REPO}`;
+    const actions = [];
+    const body = seed.body;
+    const expected = structuredClone(pr);
+    if (full || pr.title !== seed.title || (pr.body || "") !== body || pr.base.ref !== seed.base) {
+        actions.push(requestAction(`Restore title/body/base on prepared PR #${pr.number}`,
+            `${prefix}/pulls/${pr.number}`, "PATCH", { title: seed.title, body, base: seed.base }, prGuard(expected, sha)));
+        Object.assign(expected, { title: seed.title, body, base: { ref: seed.base, sha: baseSha } });
+    }
+    if (full || !equal(labelNames(pr), [...seed.labels].sort())) {
+        actions.push(requestAction(`Restore labels on prepared PR #${pr.number}`,
+            `${prefix}/issues/${pr.number}/labels`, "PUT", { labels: [...seed.labels].sort() }, prGuard(expected, sha)));
+        expected.labels = seed.labels.map((name) => ({ name }));
+    }
+    if (pr.draft !== seed.draft) {
+        actions.push({ kind: "draft-pr", label: `Restore draft status on prepared PR #${pr.number}`,
+            number: pr.number, draft: seed.draft, guard: prGuard(expected, sha) });
+    }
+    return actions;
+}
+
+function issueState(issue) {
+    return { number: issue.number, state: issue.state,
+        assignees: issue.assignees.map(({ login }) => login).sort(), updated_at: issue.updated_at ?? null };
+}
+
+function canonical(value) {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort()
+        .filter((key) => value[key] !== undefined).map((key) => [key, canonical(value[key])]));
+    return value;
+}
+
+function normalizedState(state) {
+    return { ...state, branches: Object.fromEntries(sortedEntries(state.branches)),
+        prs: [...state.prs].sort(byNumber).map((pr) => ({ ...pr, labels: [...pr.labels].sort() })),
+        issues: [...state.issues].sort(byNumber).map((issue) => ({
+            ...issue, assignees: [...issue.assignees].sort(),
+        })) };
+}
+
+export function preview(state, live, baselineSha) {
+    const actions = buildPlan(state, live, baselineSha);
+    const normalized = {
+        baseline: normalizedState(state), baselineSha, repositoryId: live.repositoryId, actor: live.actor,
+        branches: Object.fromEntries(sortedEntries(live.branches)),
+        prs: [...live.prs].sort(byNumber).map((pr) => ({
+            number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
+            state: pr.state, title: pr.title, body: pr.body || "", draft: pr.draft,
+            merged_at: pr.merged_at, head: {
+                ref: pr.head.ref, sha: pr.head.sha, repo: pr.head.repo?.full_name,
+            }, base: { ref: pr.base.ref, sha: pr.base.sha, repo: pr.base.repo?.full_name },
+            labels: labelNames(pr),
+            reviews: [...pr.reviews].sort((a, b) => a.id - b.id),
+            reviewComments: [...pr.reviewComments].sort((a, b) => a.id - b.id),
+            issueComments: [...pr.issueComments].sort((a, b) => a.id - b.id),
+        })),
+        issues: live.issues.filter((issue) => state.issues.some((seed) => seed.number === issue.number))
+            .sort(byNumber).map(issueState),
+        alerts: Object.fromEntries(sortedEntries(live.alerts).map(([kind, alerts]) => [kind,
+            [...alerts].sort(byNumber).map(alertState),
+        ])),
+    };
+    const payload = {
+        version: 1, repo: REPO,
+        actions: [{ kind: "verify-state", label: "Verify the complete reviewed reset state", expected: normalized }, ...actions],
+        warnings: [
+            "Destructive repository-wide demo reset: post-baseline PRs and branches are closed/deleted.",
+            "Fixed alerts require a rescan; replacing reviewed prepared PRs creates new URLs but preserves old history.",
+            "Reopening auto-dismissed alerts may override auto-triage decisions.",
+            "Stop all writers: refs use atomic compare-and-swap, but GitHub PR/issue/alert mutations are not transactional.",
+            "Fresh prepared PRs keep the exact recorded body. A visible provenance receipt is posted on the original PR.",
+            "A created PR without a verified provenance receipt blocks automatic retries; inspect and reconcile it manually.",
+        ],
+    };
+    return canonical({ ...payload,
+        fingerprint: createHash("sha256").update(JSON.stringify(canonical(payload))).digest("hex") });
+}
+
+export function assertExpectedPreview(plan, expected) {
+    if (expected !== plan.fingerprint) {
+        throw new Error("Reset plan changed since preview. Preview again and confirm the new fingerprint.");
+    }
+}
 
 // Pure planning keeps destructive scope and execution ordering testable without GitHub.
 export function buildPlan(state, live, baselineSha) {
     validateState(state);
     if (!/^[a-f0-9]{40}$/.test(baselineSha)) throw new Error("Invalid demo-baseline commit.");
+    if (typeof live.repositoryId !== "string" || !live.repositoryId) throw new Error("Missing repository node ID.");
+    if (Object.values(live.branches).some((sha) => !/^[a-f0-9]{40}$/.test(sha))) {
+        throw new Error("Invalid live branch SHA; refusing an incomplete reset.");
+    }
+    for (const pr of live.prs) {
+        if (!/^[a-f0-9]{40}$/.test(pr.head.sha) || !/^[a-f0-9]{40}$/.test(pr.base.sha) ||
+            !Array.isArray(pr.reviews) || !Array.isArray(pr.reviewComments) ||
+            !Array.isArray(pr.issueComments) || typeof pr.node_id !== "string" || !pr.node_id || !validUser(pr.user) ||
+            !pr.issueComments.every((c) => Number.isSafeInteger(c.id) && typeof c.body === "string" && validUser(c.user))) {
+            throw new Error(`Missing PR head/review state for #${pr.number}; refusing an incomplete reset.`);
+        }
+    }
     const actions = [];
-    const request = (label, path, method, body, guard) =>
-        actions.push({ kind: "request", label, path, method, body, ...(guard ? { guard } : {}) });
+    const request = (...args) => actions.push(requestAction(...args));
     const prefix = `repos/${state.repo}`;
     const wanted = { main: baselineSha, ...state.branches };
-    for (const pr of live.prs.filter((pr) => pr.state === "open")) {
-        if (state.prs.some((seed) => samePR(pr, seed, state.repo))) continue;
-        request(`Close demo-created PR #${pr.number}: ${pr.title}`,
-            `${prefix}/pulls/${pr.number}`, "PATCH", { state: "closed" });
-    }
-    for (const [name, sha] of Object.entries(wanted)) {
-        const current = live.branches[name];
-        if (!current) {
-            request(`Recreate branch ${name} at ${sha.slice(0, 7)}`,
-                `${prefix}/git/refs`, "POST", { ref: `refs/heads/${name}`, sha });
-        } else if (current !== sha) {
-            request(`Restore ${name} to ${sha.slice(0, 7)} (was ${current.slice(0, 7)})`,
-                `${prefix}/git/refs/heads/${name}`, "PATCH", { sha, force: true }, current);
+    const seeds = [...state.prs].sort(byNumber);
+    if (seeds.length && !validUser(live.actor)) throw new Error("Missing authenticated receipt author identity.");
+    const identities = new Map(seeds.map((seed) => {
+        const sha = state.branches[seed.head];
+        const original = live.prs.find((pr) => pr.number === seed.number);
+        if (!original || !headMatches(original, seed)) throw new Error(`Recorded PR #${seed.number} missing or changed identity.`);
+        const candidates = live.prs.filter((pr) => headMatches(pr, seed));
+        if (candidates.some((pr) => pr.state === "open" && pr !== original && !replacementMatches(pr, seed, sha, original))) {
+            throw new Error(`Unknown open same-head PR for prepared PR #${seed.number}; missing/invalid provenance receipt. ` +
+                "Inspect the candidate and reconcile provenance manually before retrying; no PR will be adopted by recency.");
         }
+        const known = candidates.filter((pr) => pr === original || replacementMatches(pr, seed, sha, original)).sort(byNumber);
+        if (known.filter((pr) => pr.state === "open").length > 1) {
+            throw new Error(`Multiple known open prepared PRs for #${seed.number}; review manually.`);
+        }
+        return [seed.number, known];
+    }));
+    for (const pr of [...live.prs].sort(byNumber).filter((pr) => pr.state === "open")) {
+        if ([...identities.values()].some((known) => known.includes(pr))) continue;
+        request(`Close demo-created PR #${pr.number}: ${pr.title}`,
+            `${prefix}/pulls/${pr.number}`, "PATCH", { state: "closed" }, prGuard(pr));
+    }
+    const refUpdate = (label, name, beforeOid, afterOid) => actions.push({
+        kind: "ref-update", label, path: "graphql", method: "POST",
+        body: { query: UPDATE_REFS, variables: { input: {
+            repositoryId: live.repositoryId,
+            refUpdates: [{ name: `refs/heads/${name}`, beforeOid, afterOid, force: true }],
+        } } },
+    });
+    for (const [name, sha] of [["main", baselineSha], ...sortedEntries(state.branches)]) {
+        const current = live.branches[name] || ZERO;
+        if (current !== sha) refUpdate(`${current === ZERO ? "Recreate" : "Restore"} ${name} to ${sha.slice(0, 7)}`,
+            name, current, sha);
     }
     // Restore refs first: merged PRs need their original diff before they can be recreated.
-    for (const seed of state.prs) {
-        const matches = live.prs.filter((pr) => samePR(pr, seed, state.repo));
-        if (matches.some((pr) => pr.state === "open")) continue;
-        const prior = matches.sort((a, b) => b.number - a.number)[0];
+    const restoredPR = (pr) => ({ ...pr, base: { ...pr.base, sha: wanted[pr.base.ref] || pr.base.sha } });
+    for (const seed of seeds) {
+        const sha = state.branches[seed.head];
+        const known = identities.get(seed.number);
+        const open = known.find((pr) => pr.state === "open");
+        if (open && !reviewed(open)) {
+            actions.push(...metadataActions(seed, restoredPR(open), sha, baselineSha));
+            continue;
+        }
+        if (open) request(`Close reviewed prepared PR #${open.number} before replacement`,
+            `${prefix}/pulls/${open.number}`, "PATCH", { state: "closed" }, prGuard(restoredPR(open), sha));
+        const reopenable = known.filter((pr) => pr.state === "closed" && !pr.merged_at && !reviewed(pr));
+        const prior = !open && reopenable.length === 1 ? reopenable[0] : undefined;
+        const original = restoredPR(live.prs.find((pr) => pr.number === seed.number));
+        const originalAfterClose = { ...original, state: open?.number === seed.number ? "closed" : original.state };
+        const replacementExpected = {
+            ...original, number: "$created.number", node_id: "$created.node_id", user: identity(live.actor),
+            state: "open", merged_at: null, title: seed.title, body: seed.body, draft: seed.draft,
+            labels: [], reviews: [], reviewComments: [], issueComments: [],
+            head: { ref: seed.head, sha, repo: { full_name: REPO } }, base: { ref: seed.base, sha: baselineSha },
+        };
+        const replacementGuard = prGuard(replacementExpected, sha);
+        const create = requestAction(`Create fresh prepared PR for #${seed.number}`, `${prefix}/pulls`, "POST", {
+            head: seed.head, base: seed.base, title: seed.title,
+            body: seed.body, draft: seed.draft,
+        }, prGuard(originalAfterClose, sha));
+        const receipt = {
+            kind: "provenance-receipt", label: `Post visible replacement provenance receipt on original PR #${seed.number}`,
+            path: `${prefix}/issues/${seed.number}/comments`, method: "POST",
+            body: { body: receiptBody({
+                version: 1, repo: REPO, originalNumber: seed.number,
+                replacementNumber: "$created.number", replacementNodeId: "$created.node_id",
+                seededHead: { ref: seed.head, sha }, creator: identity(live.actor),
+            }) },
+            author: identity(live.actor),
+            guard: prGuard(originalAfterClose, sha),
+            replacementGuard,
+        };
+        const repairs = [requestAction("Restore replacement labels",
+            `${prefix}/issues/$created.number/labels`, "PUT", { labels: [...seed.labels].sort() },
+            replacementGuard)];
         actions.push({
-            kind: "restore-pr", seed, prior,
-            label: `${prior && !prior.merged_at ? "Reopen" : "Recreate"} seeded PR: ${seed.title}`,
+            kind: "restore-pr", label: `${prior ? "Reopen" : "Recreate"} seeded PR: ${seed.title}`,
+            headGuard: { head: seed.head, sha, repo: REPO },
+            ...(prior ? { reopen: {
+                action: requestAction(`Reopen prepared PR #${prior.number}`, `${prefix}/pulls/${prior.number}`,
+                    "PATCH", { state: "open" }, prGuard(restoredPR(prior), sha)),
+                repairs: metadataActions(seed, { ...restoredPR(prior), state: "open" }, sha, baselineSha, true),
+                onHTTP422: { create, receipt, repairs },
+            } } : { create, receipt, repairs }),
         });
     }
-    for (const [name, sha] of Object.entries(live.branches)) {
+    for (const [name, sha] of sortedEntries(live.branches)) {
         if (Object.hasOwn(wanted, name)) continue;
-        request(`Delete post-baseline branch ${name}`,
-            `${prefix}/git/refs/heads/${name}`, "DELETE", undefined, sha);
+        refUpdate(`Delete post-baseline branch ${name}`, name, sha, ZERO);
     }
-    for (const seed of state.issues) {
+    for (const seed of [...state.issues].sort(byNumber)) {
         const issue = live.issues.find((issue) => issue.number === seed.number);
         if (!issue) throw new Error(`Seeded issue #${seed.number} is missing; refusing partial reset.`);
-        if (issue.state !== "open") {
-            request(`Reopen issue #${seed.number}`, `${prefix}/issues/${seed.number}`, "PATCH", { state: "open" });
-        }
-        const current = issue.assignees.map((assignee) => assignee.login);
-        const extra = current.filter((login) => !seed.assignees.includes(login));
-        const missing = seed.assignees.filter((login) => !current.includes(login));
-        if (extra.length) request(`Unassign ${extra.join(", ")} from issue #${seed.number}`,
-            `${prefix}/issues/${seed.number}/assignees`, "DELETE", { assignees: extra });
-        if (missing.length) request(`Reassign ${missing.join(", ")} to issue #${seed.number} (may start an agent)`,
-            `${prefix}/issues/${seed.number}/assignees`, "POST", { assignees: missing });
+        const current = issue.assignees.map((assignee) => assignee.login).sort();
+        const body = {
+            ...(issue.state !== "open" ? { state: "open" } : {}),
+            ...(!equal(current, [...seed.assignees].sort()) ? { assignees: [...seed.assignees].sort() } : {}),
+        };
+        if (Object.keys(body).length) actions.push({
+            ...requestAction(`Restore issue #${seed.number}${seed.assignees.length ? " (assignment may start an agent)" : ""}`,
+                `${prefix}/issues/${seed.number}`, "PATCH", body), issueGuard: issueState(issue),
+        });
     }
-    for (const [kind, alerts] of Object.entries(live.alerts)) {
-        for (const alert of alerts) {
-            if (["dismissed", "auto_dismissed"].includes(alert.state)) {
-                request(`Reopen ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
-                    "PATCH", { state: "open" });
-            }
-            if (alert.assignees?.length) {
-                request(`Clear assignees on ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
-                    "PATCH", { assignees: [] });
-            }
+    for (const [kind, alerts] of sortedEntries(live.alerts)) {
+        for (const alert of [...alerts].sort(byNumber)) {
+            const body = {
+                ...(["dismissed", "auto_dismissed"].includes(alert.state) ? { state: "open" } : {}),
+                ...(alert.assignees?.length ? { assignees: [] } : {}),
+            };
+            if (Object.keys(body).length) actions.push({
+                ...requestAction(`Restore ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
+                    "PATCH", body), alertGuard: alertState(alert),
+            });
         }
     }
     return actions;
 }
 
-function snapshot() {
+export function snapshot(read = pages) {
     const prefix = `repos/${REPO}`;
     return {
-        branches: Object.fromEntries(pages(`${prefix}/branches?per_page=100`).map((b) => [b.name, b.commit.sha])),
-        prs: pages(`${prefix}/pulls?state=all&per_page=100`),
-        issues: pages(`${prefix}/issues?state=all&per_page=100`).filter((issue) => !issue.pull_request),
+        branches: Object.fromEntries(read(`${prefix}/branches?per_page=100`).map((b) => [b.name, b.commit.sha])),
+        prs: read(`${prefix}/pulls?state=all&per_page=100`).map((pr) => ({
+            ...pr, ...prDiscussion(pr.number, read),
+        })),
+        issues: read(`${prefix}/issues?state=all&per_page=100`).filter((issue) => !issue.pull_request),
         alerts: {
-            "code-scanning": optionalPages(`${prefix}/code-scanning/alerts?per_page=100`),
-            dependabot: optionalPages(`${prefix}/dependabot/alerts?per_page=100`),
+            "code-scanning": collectAlerts("code-scanning", read),
+            dependabot: collectAlerts("dependabot", read),
         },
     };
 }
 
-function execute(action) {
-    if (action.kind === "request") {
-        if (action.guard && api(action.path.replace("/git/refs/", "/git/ref/")).object.sha !== action.guard) {
-            throw new Error(`Branch changed since preview: ${action.label}. Run again after stopping writers.`);
+function prDiscussion(number, read) {
+    const prefix = `repos/${REPO}`;
+    return {
+        reviews: read(`${prefix}/pulls/${number}/reviews?per_page=100`).map(
+            ({ id, state, body, commit_id, submitted_at }) => canonical({ id, state, body, commit_id, submitted_at })),
+        reviewComments: read(`${prefix}/pulls/${number}/comments?per_page=100`).map(
+            ({ id, body, updated_at, commit_id }) => canonical({ id, body, updated_at, commit_id })),
+        issueComments: read(`${prefix}/issues/${number}/comments?per_page=100`).map(
+            ({ id, body, user, updated_at }) => canonical({ id, body, user: identity(user), updated_at })),
+    };
+}
+
+function requestPages(path, request) {
+    const result = [];
+    for (let page = 1; ; page++) {
+        const batch = request(`${path}&page=${page}`);
+        if (!Array.isArray(batch)) throw new Error(`Invalid paginated guard response: ${path}`);
+        result.push(...batch);
+        if (batch.length < 100) return result;
+    }
+}
+
+function checkPRGuard(guard, request) {
+    const pr = request(`repos/${REPO}/pulls/${guard.number}`);
+    const current = { ...pr, ...prDiscussion(guard.number, (path) => requestPages(path, request)) };
+    if (!equal(prGuard(current), guard)) {
+        throw new Error(`PR head/review/metadata changed since preview: #${guard.number}.`);
+    }
+    if (request(`repos/${REPO}/git/ref/heads/${branchPath(guard.base)}`).object.sha !== guard.baseSha) {
+        throw new Error(`PR base branch changed since preview: #${guard.number}.`);
+    }
+}
+
+export function execute(action, request = api, command = run, log = console.log) {
+    if (action.kind === "verify-state") return;
+    if (action.guard) {
+        checkPRGuard(action.guard, request);
+    }
+    if (action.alertGuard) {
+        if (!equal(alertState(request(action.path)), action.alertGuard)) {
+            throw new Error(`Alert state/assignees/update time changed since preview: ${action.label}.`);
         }
-        api(action.path, action.method, action.body);
+    }
+    if (action.issueGuard && !equal(issueState(request(action.path)), action.issueGuard)) {
+        throw new Error(`Issue state/assignees/update time changed since preview: ${action.label}.`);
+    }
+    if (action.kind === "ref-update") {
+        const result = request(action.path, action.method, action.body);
+        if (result?.errors?.length || !result?.data?.updateRefs) {
+            throw new Error(`Atomic ref update rejected: ${JSON.stringify(result?.errors || result)}.`);
+        }
         return;
     }
-    const { seed, prior } = action;
-    if (prior && !prior.merged_at) {
-        try {
-            api(`repos/${REPO}/pulls/${prior.number}`, "PATCH", { state: "open" });
-            return;
-        } catch (error) {
-            // GitHub refuses to reopen some PRs after their head was force-pushed.
-            if (!String(error.stderr).includes("HTTP 422")) throw error;
-            console.log(`  GitHub refused reopening #${prior.number}; recreating its seeded diff.`);
-        }
+    if (action.kind === "request") {
+        request(action.path, action.method, action.body);
+        return;
     }
-    const created = api(`repos/${REPO}/pulls`, "POST", {
-        head: seed.head, base: seed.base, title: seed.title, body: seed.body, draft: seed.draft,
-    });
-    console.log(`  Seeded PR replacement: ${created.html_url}`);
-    if (seed.labels.length) api(`repos/${REPO}/issues/${created.number}/labels`, "POST", { labels: seed.labels });
+    if (action.kind === "draft-pr") {
+        command("gh", ["pr", "ready", String(action.number), "--repo", REPO, ...(action.draft ? ["--undo"] : [])]);
+        return;
+    }
+    if (action.kind === "provenance-receipt") {
+        if (!equal(identity(request("user")), action.author)) throw new Error("Receipt author changed since preview.");
+        checkPRGuard(action.replacementGuard, request);
+        const comment = request(action.path, action.method, action.body);
+        if (!Number.isSafeInteger(comment?.id) || comment.body !== action.body.body ||
+            !equal(identity(comment.user), action.author)) {
+            throw new Error("Receipt response was not verifiable; receipt may have applied. Preview again before retrying.");
+        }
+        return;
+    }
+    if (action.kind !== "restore-pr") throw new Error(`Unknown reset action: ${action.kind}`);
+    const ref = request(`repos/${REPO}/git/ref/heads/${branchPath(action.headGuard.head)}`);
+    if (ref.object.sha !== action.headGuard.sha) {
+        throw new Error(`Prepared branch changed since restoration: ${action.headGuard.head}.`);
+    }
+    let creation = action;
+    if (action.reopen) {
+        let fallback = false;
+        // Only a 422 from the reopen request selects the explicitly previewed fallback.
+        // Guard or repair failures must never create a second PR.
+        const { guard, ...reopen } = action.reopen.action;
+        checkPRGuard(guard, request);
+        try {
+            execute(reopen, request, command, log);
+        } catch (error) {
+            if (!String(error.stderr).includes("HTTP 422")) throw error;
+            fallback = true;
+            log(`  GitHub refused reopening #${guard.number}; using the previewed replacement fallback.`);
+        }
+        if (!fallback) {
+            for (const update of action.reopen.repairs) executeRepair(update, request, command, log);
+            return;
+        }
+        creation = action.reopen.onHTTP422;
+    }
+    if (!equal(identity(request("user")), creation.receipt.author)) {
+        throw new Error("Replacement creator changed since preview.");
+    }
+    checkPRGuard(creation.create.guard, request);
+    const created = request(creation.create.path, creation.create.method, creation.create.body);
+    if (!Number.isSafeInteger(created?.number) || !created?.html_url || typeof created.node_id !== "string" ||
+        !created.node_id || !equal(identity(created.user), creation.receipt.author)) {
+        throw new Error("Missing replacement PR response. Creation may have applied; preview again before retrying.");
+    }
+    log(`  Seeded PR replacement: ${created.html_url}`);
+    const receipt = creation.receipt;
+    const binding = JSON.parse(receipt.body.body.slice(`${RECEIPT_TITLE}\n\n\`\`\`json\n`.length, -4));
+    binding.replacementNumber = created.number;
+    binding.replacementNodeId = created.node_id;
+    executeRepair({ ...receipt, body: { body: receiptBody(binding) },
+        replacementGuard: { ...receipt.replacementGuard, number: created.number, nodeId: created.node_id },
+    }, request, command, log);
+    for (const repair of creation.repairs) executeRepair({
+        ...repair, path: repair.path.replace("$created.number", String(created.number)),
+        guard: { ...repair.guard, number: created.number, nodeId: created.node_id },
+    }, request, command, log);
+}
+
+function executeRepair(action, request, command, log) {
+    try {
+        execute(action, request, command, log);
+    } catch (error) {
+        throw new Error(`Failed repair "${action.label}": ${String(error.stderr || error.message).trim()}`, { cause: error });
+    }
 }
 
 function record() {
@@ -218,44 +574,79 @@ function record() {
         `${state.issues.length} issues. ${TAG} -> ${sha}`);
 }
 
-export function main(args = process.argv.slice(2)) {
-    if (args.some((arg) => !["--confirm", "--record", "--help"].includes(arg)) ||
-        (args.includes("--record") && args.includes("--confirm"))) {
-        throw new Error("Use no flags (preview), --confirm (apply), or --record (replace baseline).");
+export function main(args = process.argv.slice(2), {
+    request = api, readSnapshot = snapshot,
+    readState = () => JSON.parse(readFileSync(resolve(ROOT, STATE_FILE), "utf8")),
+    apply = execute, log = console.log,
+} = {}) {
+    const index = args.indexOf("--expected-preview");
+    const expected = index === -1 ? undefined : args[index + 1];
+    const flags = args.filter((_, i) => i !== index && (index === -1 || i !== index + 1));
+    if ((flags.includes("--confirm") && index === -1) ||
+        (index !== -1 && (!/^[a-f0-9]{64}$/.test(expected || "") || !flags.includes("--confirm"))) ||
+        flags.some((arg) => !["--confirm", "--record", "--help", "--preview-json"].includes(arg)) ||
+        new Set(flags).size !== flags.length ||
+        (flags.includes("--record") && flags.length !== 1) ||
+        (flags.includes("--preview-json") && flags.length !== 1)) {
+        throw new Error("Use preview, --preview-json, --confirm --expected-preview <sha256>, or --record.");
     }
     if (args.includes("--help")) {
-        console.log("node demo/remote-reset.mjs [--confirm | --record]\n" +
+        log("node demo/remote-reset.mjs [--preview-json | --confirm --expected-preview <sha256> | --record]\n" +
             "Preview by default. --confirm resets remote demo state. --record commits/pushes a new baseline and moves demo-baseline.");
         return;
     }
-    const repo = api(`repos/${REPO}`);
+    const repo = request(`repos/${REPO}`);
     if (repo.full_name !== REPO || repo.default_branch !== "main" || !repo.permissions?.push) {
         throw new Error(`Expected write access to ${REPO} with default branch main.`);
     }
     if (args.includes("--record")) return record();
-    const state = JSON.parse(readFileSync(resolve(ROOT, STATE_FILE), "utf8"));
+    const state = readState();
     validateState(state);
-    const tag = api(`repos/${REPO}/git/ref/tags/${TAG}`);
+    const tag = request(`repos/${REPO}/git/ref/tags/${TAG}`);
     if (tag.object.type !== "commit") throw new Error("Expected a lightweight demo-baseline tag pointing to a commit.");
-    const recorded = api(`repos/${REPO}/contents/${STATE_FILE}?ref=${tag.object.sha}`);
+    const recorded = request(`repos/${REPO}/contents/${STATE_FILE}?ref=${tag.object.sha}`);
     const remoteState = JSON.parse(Buffer.from(recorded.content, "base64").toString("utf8"));
     if (JSON.stringify(state) !== JSON.stringify(remoteState)) {
         throw new Error("Local baseline differs from demo-baseline. Update this checkout before resetting.");
     }
-    const actions = buildPlan(state, snapshot(), tag.object.sha);
-    const confirm = args.includes("--confirm");
-    console.log(`${confirm ? "Resetting" : "Preview (no changes) for"} ${REPO}:`);
-    if (!actions.length) console.log("Already at baseline. Nothing to do.");
-    for (const action of actions) {
-        console.log(`- ${action.label}`);
-        if (confirm) execute(action);
+    const live = () => ({ ...readSnapshot(), repositoryId: repo.node_id,
+        ...(state.prs.length ? { actor: identity(request("user")) } : {}) });
+    const plan = preview(state, live(), tag.object.sha);
+    if (args.includes("--preview-json")) {
+        log(JSON.stringify(plan));
+        return;
     }
-    if (!confirm && actions.length) console.log("Run with --confirm to apply this destructive remote reset.");
-    if (confirm && actions.length) {
-        const remaining = buildPlan(state, snapshot(), tag.object.sha);
-        if (remaining.length) throw new Error(`Reset incomplete; re-run preview:\n${remaining.map((a) => a.label).join("\n")}`);
-        console.log("Remote reset verified. Local worktrees were not changed.");
-        console.log("Fixed alerts return only after CodeQL/Dependabot rescan restored main; reviews and history remain.");
+    const confirm = args.includes("--confirm");
+    if (confirm) assertExpectedPreview(plan, expected);
+    const { actions } = plan;
+    log(`${confirm ? "Resetting" : "Preview (no changes) for"} ${REPO}:`);
+    for (const warning of plan.warnings) log(`Warning: ${warning}`);
+    if (actions.length === 1) log("Already at baseline. Nothing to do.");
+    for (const action of actions) {
+        log(`- ${action.label}`);
+        if (confirm) {
+            try {
+                apply(action);
+            } catch (error) {
+                throw new Error(`Failed action "${action.label}". Earlier actions may have applied. ` +
+                    `Preview again and confirm the new fingerprint before retrying. ` +
+                    String(error.stderr || error.message).trim(), { cause: error });
+            }
+        }
+    }
+    if (!confirm) log(`Run with --confirm --expected-preview ${plan.fingerprint} to apply this destructive remote reset.`);
+    if (confirm) {
+        let remaining;
+        try {
+            remaining = buildPlan(state, live(), tag.object.sha);
+        } catch (error) {
+            throw new Error(`Post-reset verification failed; earlier actions may have applied. Preview again before retrying. ` +
+                String(error.stderr || error.message).trim(), { cause: error });
+        }
+        if (remaining.length) throw new Error(`Reset incomplete; earlier actions may have applied. ` +
+            `Preview again and confirm the new fingerprint:\n${remaining.map((a) => a.label).join("\n")}`);
+        log("Remote reset verified. Local worktrees were not changed.");
+        log("Fixed alerts require a rescan; replaced prepared PRs have new URLs and old history remains.");
     }
 }
 
