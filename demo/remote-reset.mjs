@@ -150,7 +150,7 @@ const prGuard = (pr, sha = pr.head.sha) => ({
     number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
     head: pr.head.ref, repo: pr.head.repo?.full_name ?? null, sha,
     state: pr.state, merged_at: pr.merged_at ?? null, title: pr.title, body: pr.body || "",
-    base: pr.base.ref, draft: pr.draft, labels: labelNames(pr),
+    base: pr.base.ref, baseSha: pr.base.sha, draft: pr.draft, labels: labelNames(pr),
     reviews: pr.reviews.map(({ id, state, body, commit_id, submitted_at }) =>
         canonical({ id, state, body, commit_id, submitted_at })).sort((a, b) => a.id - b.id),
     reviewComments: pr.reviewComments.map(({ id, body, updated_at, commit_id }) =>
@@ -162,7 +162,7 @@ const requestAction = (label, path, method, body, guard) => ({
     kind: "request", label, path, method, body, ...(guard ? { guard } : {}),
 });
 
-function metadataActions(seed, pr, sha, full = false) {
+function metadataActions(seed, pr, sha, baseSha, full = false) {
     const prefix = `repos/${REPO}`;
     const actions = [];
     const body = seed.body;
@@ -170,7 +170,7 @@ function metadataActions(seed, pr, sha, full = false) {
     if (full || pr.title !== seed.title || (pr.body || "") !== body || pr.base.ref !== seed.base) {
         actions.push(requestAction(`Restore title/body/base on prepared PR #${pr.number}`,
             `${prefix}/pulls/${pr.number}`, "PATCH", { title: seed.title, body, base: seed.base }, prGuard(expected, sha)));
-        Object.assign(expected, { title: seed.title, body, base: { ref: seed.base } });
+        Object.assign(expected, { title: seed.title, body, base: { ref: seed.base, sha: baseSha } });
     }
     if (full || !equal(labelNames(pr), [...seed.labels].sort())) {
         actions.push(requestAction(`Restore labels on prepared PR #${pr.number}`,
@@ -182,6 +182,11 @@ function metadataActions(seed, pr, sha, full = false) {
             number: pr.number, draft: seed.draft, guard: prGuard(expected, sha) });
     }
     return actions;
+}
+
+function issueState(issue) {
+    return { number: issue.number, state: issue.state,
+        assignees: issue.assignees.map(({ login }) => login).sort(), updated_at: issue.updated_at ?? null };
 }
 
 function canonical(value) {
@@ -216,9 +221,7 @@ export function preview(state, live, baselineSha) {
             issueComments: [...pr.issueComments].sort((a, b) => a.id - b.id),
         })),
         issues: live.issues.filter((issue) => state.issues.some((seed) => seed.number === issue.number))
-            .sort(byNumber).map(({ number, state, assignees }) => ({
-                number, state, assignees: assignees.map((a) => a.login).sort(),
-            })),
+            .sort(byNumber).map(issueState),
         alerts: Object.fromEntries(sortedEntries(live.alerts).map(([kind, alerts]) => [kind,
             [...alerts].sort(byNumber).map(alertState),
         ])),
@@ -254,7 +257,8 @@ export function buildPlan(state, live, baselineSha) {
         throw new Error("Invalid live branch SHA; refusing an incomplete reset.");
     }
     for (const pr of live.prs) {
-        if (!/^[a-f0-9]{40}$/.test(pr.head.sha) || !Array.isArray(pr.reviews) || !Array.isArray(pr.reviewComments) ||
+        if (!/^[a-f0-9]{40}$/.test(pr.head.sha) || !/^[a-f0-9]{40}$/.test(pr.base.sha) ||
+            !Array.isArray(pr.reviews) || !Array.isArray(pr.reviewComments) ||
             !Array.isArray(pr.issueComments) || typeof pr.node_id !== "string" || !pr.node_id || !validUser(pr.user) ||
             !pr.issueComments.every((c) => Number.isSafeInteger(c.id) && typeof c.body === "string" && validUser(c.user))) {
             throw new Error(`Missing PR head/review state for #${pr.number}; refusing an incomplete reset.`);
@@ -299,25 +303,26 @@ export function buildPlan(state, live, baselineSha) {
             name, current, sha);
     }
     // Restore refs first: merged PRs need their original diff before they can be recreated.
+    const restoredPR = (pr) => ({ ...pr, base: { ...pr.base, sha: wanted[pr.base.ref] || pr.base.sha } });
     for (const seed of seeds) {
         const sha = state.branches[seed.head];
         const known = identities.get(seed.number);
         const open = known.find((pr) => pr.state === "open");
         if (open && !reviewed(open)) {
-            actions.push(...metadataActions(seed, open, sha));
+            actions.push(...metadataActions(seed, restoredPR(open), sha, baselineSha));
             continue;
         }
         if (open) request(`Close reviewed prepared PR #${open.number} before replacement`,
-            `${prefix}/pulls/${open.number}`, "PATCH", { state: "closed" }, prGuard(open, sha));
+            `${prefix}/pulls/${open.number}`, "PATCH", { state: "closed" }, prGuard(restoredPR(open), sha));
         const reopenable = known.filter((pr) => pr.state === "closed" && !pr.merged_at && !reviewed(pr));
         const prior = !open && reopenable.length === 1 ? reopenable[0] : undefined;
-        const original = live.prs.find((pr) => pr.number === seed.number);
+        const original = restoredPR(live.prs.find((pr) => pr.number === seed.number));
         const originalAfterClose = { ...original, state: open?.number === seed.number ? "closed" : original.state };
         const replacementExpected = {
             ...original, number: "$created.number", node_id: "$created.node_id", user: identity(live.actor),
             state: "open", merged_at: null, title: seed.title, body: seed.body, draft: seed.draft,
             labels: [], reviews: [], reviewComments: [], issueComments: [],
-            head: { ref: seed.head, sha, repo: { full_name: REPO } }, base: { ref: seed.base },
+            head: { ref: seed.head, sha, repo: { full_name: REPO } }, base: { ref: seed.base, sha: baselineSha },
         };
         const replacementGuard = prGuard(replacementExpected, sha);
         const create = requestAction(`Create fresh prepared PR for #${seed.number}`, `${prefix}/pulls`, "POST", {
@@ -344,8 +349,8 @@ export function buildPlan(state, live, baselineSha) {
             headGuard: { head: seed.head, sha, repo: REPO },
             ...(prior ? { reopen: {
                 action: requestAction(`Reopen prepared PR #${prior.number}`, `${prefix}/pulls/${prior.number}`,
-                    "PATCH", { state: "open" }, prGuard(prior, sha)),
-                repairs: metadataActions(seed, { ...prior, state: "open" }, sha, true),
+                    "PATCH", { state: "open" }, prGuard(restoredPR(prior), sha)),
+                repairs: metadataActions(seed, { ...restoredPR(prior), state: "open" }, sha, baselineSha, true),
                 onHTTP422: { create, receipt, repairs },
             } } : { create, receipt, repairs }),
         });
@@ -357,16 +362,15 @@ export function buildPlan(state, live, baselineSha) {
     for (const seed of [...state.issues].sort(byNumber)) {
         const issue = live.issues.find((issue) => issue.number === seed.number);
         if (!issue) throw new Error(`Seeded issue #${seed.number} is missing; refusing partial reset.`);
-        if (issue.state !== "open") {
-            request(`Reopen issue #${seed.number}`, `${prefix}/issues/${seed.number}`, "PATCH", { state: "open" });
-        }
         const current = issue.assignees.map((assignee) => assignee.login).sort();
-        const extra = current.filter((login) => !seed.assignees.includes(login));
-        const missing = seed.assignees.filter((login) => !current.includes(login)).sort();
-        if (extra.length) request(`Unassign ${extra.join(", ")} from issue #${seed.number}`,
-            `${prefix}/issues/${seed.number}/assignees`, "DELETE", { assignees: extra });
-        if (missing.length) request(`Reassign ${missing.join(", ")} to issue #${seed.number} (may start an agent)`,
-            `${prefix}/issues/${seed.number}/assignees`, "POST", { assignees: missing });
+        const body = {
+            ...(issue.state !== "open" ? { state: "open" } : {}),
+            ...(!equal(current, [...seed.assignees].sort()) ? { assignees: [...seed.assignees].sort() } : {}),
+        };
+        if (Object.keys(body).length) actions.push({
+            ...requestAction(`Restore issue #${seed.number}${seed.assignees.length ? " (assignment may start an agent)" : ""}`,
+                `${prefix}/issues/${seed.number}`, "PATCH", body), issueGuard: issueState(issue),
+        });
     }
     for (const [kind, alerts] of sortedEntries(live.alerts)) {
         for (const alert of [...alerts].sort(byNumber)) {
@@ -426,6 +430,9 @@ function checkPRGuard(guard, request) {
     if (!equal(prGuard(current), guard)) {
         throw new Error(`PR head/review/metadata changed since preview: #${guard.number}.`);
     }
+    if (request(`repos/${REPO}/git/ref/heads/${branchPath(guard.base)}`).object.sha !== guard.baseSha) {
+        throw new Error(`PR base branch changed since preview: #${guard.number}.`);
+    }
 }
 
 export function execute(action, request = api, command = run, log = console.log) {
@@ -437,6 +444,9 @@ export function execute(action, request = api, command = run, log = console.log)
         if (!equal(alertState(request(action.path)), action.alertGuard)) {
             throw new Error(`Alert state/assignees/update time changed since preview: ${action.label}.`);
         }
+    }
+    if (action.issueGuard && !equal(issueState(request(action.path)), action.issueGuard)) {
+        throw new Error(`Issue state/assignees/update time changed since preview: ${action.label}.`);
     }
     if (action.kind === "ref-update") {
         const result = request(action.path, action.method, action.body);

@@ -54,6 +54,8 @@ function fixture() {
             }
             const pr = live.prs.find((pr) => path === `${prefix}/pulls/${pr.number}`);
             if (pr) return clone(pr);
+            const issue = live.issues.find((issue) => path === `${prefix}/issues/${issue.number}`);
+            if (issue) return clone(issue);
         }
         for (const [kind, alerts] of Object.entries(live.alerts)) {
             const alert = alerts.find((alert) => path === `${prefix}/${kind}/alerts/${alert.number}`);
@@ -72,6 +74,7 @@ function fixture() {
                 if (update.afterOid === zero) delete live.branches[name];
                 else live.branches[name] = update.afterOid;
                 for (const pr of live.prs.filter((pr) => pr.head.ref === name)) pr.head.sha = update.afterOid;
+                for (const pr of live.prs.filter((pr) => pr.base.ref === name)) pr.base.sha = update.afterOid;
             }
             return { data: { updateRefs: { clientMutationId: null } } };
         }
@@ -81,7 +84,7 @@ function fixture() {
                 user: clone(live.actor), issueComments: [], state: "open", merged_at: null,
                 title: body.title, body: body.body, draft: body.draft, labels: [], reviews: [], reviewComments: [],
                 head: { ref: body.head, sha: live.branches[body.head], repo: { full_name: REPO } },
-                base: { ref: body.base }, html_url: `https://github.com/${REPO}/pull/${20 + live.prs.length}`,
+                base: { ref: body.base, sha: live.branches[body.base] }, html_url: `https://github.com/${REPO}/pull/${20 + live.prs.length}`,
             };
             live.prs.push(pr);
             return clone(pr);
@@ -93,8 +96,15 @@ function fixture() {
                 return clone(comment);
             }
             if (path === `${prefix}/pulls/${pr.number}` && method === "PATCH") {
-                Object.assign(pr, { ...body, ...(body.base ? { base: { ref: body.base } } : {}) });
+                Object.assign(pr, { ...body, ...(body.base ? { base: { ref: body.base, sha: live.branches[body.base] } } : {}) });
                 return clone(pr);
+            }
+            for (const issue of live.issues) {
+                if (path === `${prefix}/issues/${issue.number}` && method === "PATCH") {
+                    Object.assign(issue, body, { updated_at: "2026-11-02T00:00:00Z",
+                        ...(body.assignees ? { assignees: body.assignees.map((login) => ({ login })) } : {}) });
+                    return clone(issue);
+                }
             }
             if (path === `${prefix}/issues/${pr.number}/labels` && method === "PUT") {
                 pr.labels = body.labels.map((name) => ({ name }));
@@ -248,6 +258,8 @@ test("special-character branch names survive CAS unchanged and encoded REST head
 
 test("original PR base drift restores base without closing or rewriting unrelated history", () => {
     const f = fixture();
+    f.live.branches.other = sha;
+    f.state.branches.other = sha;
     f.live.prs[0].base.ref = "other";
     const actions = buildPlan(f.state, f.live, sha);
     assert.equal(actions.length, 1);
@@ -260,7 +272,7 @@ test("original PR base drift restores base without closing or rewriting unrelate
 test("unknown open same-head PRs fail closed and unknown closed history is left untouched", () => {
     for (const state of ["open", "closed"]) {
         const f = fixture();
-        f.live.prs.push({ ...clone(f.live.prs[0]), number: 100, state, base: { ref: "other" } });
+        f.live.prs.push({ ...clone(f.live.prs[0]), number: 100, state, base: { ref: "other", sha } });
         if (state === "open") assert.throws(() => preview(f.state, f.live, sha), /Unknown open same-head/);
         else assert.deepEqual(buildPlan(f.state, f.live, sha), []);
         assert.deepEqual(f.calls, []);
@@ -283,7 +295,9 @@ test("open prepared metadata repairs are fully previewed and guarded", () => {
 
 test("reopen preview explicitly includes base/title/body/labels/draft repairs and 422 replacement", () => {
     const f = fixture();
-    Object.assign(f.live.prs[0], { state: "closed", title: "Changed", body: "Changed", draft: true, base: { ref: "other" } });
+    f.live.branches.other = sha;
+    f.state.branches.other = sha;
+    Object.assign(f.live.prs[0], { state: "closed", title: "Changed", body: "Changed", draft: true, base: { ref: "other", sha } });
     const action = buildPlan(f.state, f.live, sha)[0];
     assert.equal(action.kind, "restore-pr");
     assert.deepEqual(action.reopen.action.body, { state: "open" });
@@ -400,6 +414,8 @@ test("merged originals recreate after restoring missing heads, without trying to
 
 test("known replacement base drift is restored; missing receipt fails closed instead of selecting by recency", () => {
     const f = fixture();
+    f.live.branches.other = sha;
+    f.state.branches.other = sha;
     f.live.prs[0].reviews.push({ id: 1 });
     f.confirm();
     f.live.prs[1].base.ref = "other";
@@ -615,7 +631,7 @@ test("snapshot collects review state; issue and alert resets retain existing beh
     live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "Copilot" }] };
     live.alerts["code-scanning"] = [{ number: 1, state: "dismissed", assignees: [{ login: "Copilot" }] }];
     assert.deepEqual(buildPlan(state, live, sha).map((a) => a.body), [
-        { state: "open" }, { assignees: ["Copilot"] }, { assignees: ["presenter"] },
+        { state: "open", assignees: ["presenter"] },
         { state: "open", assignees: [] },
     ]);
 });
@@ -828,4 +844,55 @@ test("combined guarded alert repair accounts for reopen and assignment clearing 
     assert.equal(f.live.alerts.dependabot[0].state, "open");
     assert.deepEqual(f.live.alerts.dependabot[0].assignees, []);
     assert.equal(f.calls.filter((c) => c.method === "PATCH").length, 1);
+});
+
+test("prepared PR guards expect restored base SHA and reject a subsequent base branch change", () => {
+    for (const scenario of ["metadata", "reviewed", "closed"]) {
+        const f = fixture();
+        f.live.branches.main = changed;
+        f.live.prs[0].base.sha = changed;
+        if (scenario === "metadata") f.live.prs[0].title = "Changed";
+        if (scenario === "reviewed") f.live.prs[0].reviews.push({ id: 1 });
+        if (scenario === "closed") f.live.prs[0].state = "closed";
+        const actions = buildPlan(f.state, f.live, sha);
+        assert.equal(actions[0].kind, "ref-update");
+        f.services.apply = (action) => {
+            execute(action, f.request, f.command, f.log);
+            if (action.kind === "ref-update") f.live.branches.main = changed;
+        };
+        assert.throws(() => f.confirm(), /Earlier actions may have applied.*PR base branch changed/);
+        assert.ok(!f.calls.some((c) => c.path.includes("/pulls") && c.method !== "GET"));
+    }
+});
+
+test("issue state/assignment/time drift blocks writes and preserves concurrent work", () => {
+    for (const mutate of [
+        (issue) => { issue.state = "open"; },
+        (issue) => { issue.assignees.push({ login: "concurrent" }); },
+        (issue) => { issue.updated_at = "2026-11-01T00:01:00Z"; },
+    ]) {
+        const f = fixture();
+        f.live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "old" }],
+            updated_at: "2026-11-01T00:00:00Z" };
+        f.services.apply = (action) => {
+            if (action.issueGuard) mutate(f.live.issues[0]);
+            execute(action, f.request, f.command, f.log);
+        };
+        assert.throws(() => f.confirm(), /Failed action "Restore issue #1".*Earlier actions may have applied.*Issue state\/assignees\/update time changed/);
+        assert.ok(!f.calls.some((c) => c.method === "PATCH"));
+    }
+});
+
+test("issue reopen and assignee restoration share one guarded write and retry converges", () => {
+    const f = fixture();
+    f.state.issues[0].assignees = ["presenter"];
+    f.live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "Copilot" }],
+        updated_at: "2026-11-01T00:00:00Z" };
+    const action = buildPlan(f.state, f.live, sha)[0];
+    assert.deepEqual(action.body, { state: "open", assignees: ["presenter"] });
+    assert.deepEqual(action.issueGuard.assignees, ["Copilot"]);
+    f.confirm();
+    f.confirm();
+    assert.equal(f.calls.filter((c) => c.method === "PATCH").length, 1);
+    assert.deepEqual(buildPlan(f.state, f.live, sha), []);
 });
