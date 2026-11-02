@@ -42,8 +42,16 @@ Each repository has its own repo-locked reset command. Run both from their own c
 
 ```sh
 node demo/remote-reset.mjs           # Preview; no changes
+node demo/remote-reset.mjs --preview-json # Machine-readable preview for the Project reset panel
 node demo/remote-reset.mjs --confirm # Close demo PRs, delete their branches, restore main and issues
+node demo/remote-reset.mjs --confirm --expected-preview <fingerprint> # Apply only the reviewed plan
 node demo/remote-reset.mjs --record  # Replace the baseline after intentional changes
 ```
 
 It mirrors virtual-universe-26's command: restores `main` to the `demo-baseline` tag, closes post-baseline PRs and deletes their branches, reopens seeded issues and restores assignees, and reopens dismissed alerts if alerts are enabled. It never changes the other repository.
+
+The JSON preview prints only `{version: 1, repo, fingerprint, actions, warnings}`. Its SHA-256 fingerprint covers normalized baseline and live action-relevant state, including PR reviews and review comments. A changed fingerprint is rejected before any reset mutation. Stop agents and other writers before confirming; branch writes also check their previewed SHA. This is a repository-wide demo reset, not a way to preserve unrelated branches or PRs inside this demo repository. Local sessions/worktrees are not changed by this script; the Project panel handles only explicitly selected demo sessions.
+
+Recorded prepared PRs have their title, body, labels, and draft status restored. Reviewed/commented prepared PRs are closed and replaced with fresh PRs and new URLs (old review history remains on the closed PR). Merged prepared PRs are also recreated. The current baseline has no prepared PRs, but the same behavior applies when they are recorded later. After a partial failure, preview again and confirm the new fingerprint: an already-created replacement is reused and unfinished metadata restoration is retried rather than creating duplicate PRs.
+
+Alert reads must succeed. HTTP 403/404 is not treated as an empty result: it can mean insufficient permission, disabled alerts, or an inaccessible endpoint. Resolve the reported feature/access problem before resetting; no successful/complete reset is claimed with unknown alert state. Fixed alerts require a later CodeQL/Dependabot rescan. Draft-state restoration uses `gh pr ready`/`--undo` and requires the corresponding GitHub authorization.
