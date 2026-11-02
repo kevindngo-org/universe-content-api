@@ -19,10 +19,11 @@ function fixture() {
         issues: [{ number: 1, assignees: [] }],
     };
     const live = {
-        repositoryId: "R_demo",
+        repositoryId: "R_demo", actor: { id: 100, login: "presenter" },
         branches: { main: sha, "feature/seed": sha },
         prs: [{
-            number: 7, state: "open", title: "Seed", merged_at: null,
+            number: 7, node_id: "PR_original", user: { id: 100, login: "presenter" },
+            issueComments: [], state: "open", title: "Seed", merged_at: null,
             body: "", draft: false, labels: [{ name: "demo" }], reviews: [], reviewComments: [],
             head: { ref: "feature/seed", sha, repo: { full_name: REPO } }, base: { ref: "main", sha },
         }],
@@ -33,6 +34,7 @@ function fixture() {
     function request(path, method = "GET", body) {
         calls.push({ path, method, body: clone(body) });
         if (method === "GET") {
+            if (path === "user") return clone(live.actor);
             if (path === prefix) return { full_name: REPO, node_id: live.repositoryId,
                 default_branch: "main", permissions: { push: true } };
             if (path.includes("/git/ref/tags/")) return { object: { type: "commit", sha } };
@@ -59,7 +61,8 @@ function fixture() {
         }
         if (path === `${prefix}/pulls` && method === "POST") {
             const pr = {
-                ...clone(live.prs[0]), number: 20 + live.prs.length, state: "open", merged_at: null,
+                ...clone(live.prs[0]), number: 20 + live.prs.length, node_id: `PR_${20 + live.prs.length}`,
+                user: clone(live.actor), issueComments: [], state: "open", merged_at: null,
                 title: body.title, body: body.body, draft: body.draft, labels: [], reviews: [], reviewComments: [],
                 head: { ref: body.head, sha: live.branches[body.head], repo: { full_name: REPO } },
                 base: { ref: body.base }, html_url: `https://github.com/${REPO}/pull/${20 + live.prs.length}`,
@@ -68,6 +71,11 @@ function fixture() {
             return clone(pr);
         }
         for (const pr of live.prs) {
+            if (path === `${prefix}/issues/${pr.number}/comments` && method === "POST") {
+                const comment = { id: 1000 + pr.issueComments.length, body: body.body, user: clone(live.actor) };
+                pr.issueComments.push(comment);
+                return clone(comment);
+            }
             if (path === `${prefix}/pulls/${pr.number}` && method === "PATCH") {
                 Object.assign(pr, { ...body, ...(body.base ? { base: { ref: body.base } } : {}) });
                 return clone(pr);
@@ -233,11 +241,12 @@ test("original PR base drift restores base without closing or rewriting unrelate
     assert.equal(f.live.prs[0].base.ref, "main");
 });
 
-test("uncertain same-head PRs fail closed regardless of base, age, or open/closed state", () => {
+test("unknown open same-head PRs fail closed and unknown closed history is left untouched", () => {
     for (const state of ["open", "closed"]) {
         const f = fixture();
         f.live.prs.push({ ...clone(f.live.prs[0]), number: 100, state, base: { ref: "other" } });
-        assert.throws(() => preview(f.state, f.live, sha), /Ambiguous same-head PR history/);
+        if (state === "open") assert.throws(() => preview(f.state, f.live, sha), /Unknown open same-head/);
+        else assert.deepEqual(buildPlan(f.state, f.live, sha), []);
         assert.deepEqual(f.calls, []);
     }
     const f = fixture();
@@ -266,7 +275,7 @@ test("reopen preview explicitly includes base/title/body/labels/draft repairs an
     assert.deepEqual(action.reopen.repairs[0].body, { title: "Seed", body: "", base: "main" });
     assert.deepEqual(action.reopen.onHTTP422.create.body, {
         head: "feature/seed", base: "main", title: "Seed",
-        body: `\n\n<!-- demo-reset:${REPO}:7:${sha} -->`, draft: false,
+        body: "", draft: false,
     });
     assert.equal(action.reopen.onHTTP422.repairs[0].path, `${prefix}/issues/$created.number/labels`);
     f.confirm();
@@ -296,7 +305,7 @@ test("only reopen 422 uses previewed fallback, never repair errors", () => {
     }
 });
 
-test("reviewed/commented originals use restored seed head guard and fresh marked PR URLs", () => {
+test("reviewed/commented originals use restored seed head guard and fresh PR URLs with exact recorded body", () => {
     for (const key of ["reviews", "reviewComments"]) {
         const f = fixture();
         f.live.branches["feature/seed"] = changed;
@@ -310,7 +319,8 @@ test("reviewed/commented originals use restored seed head guard and fresh marked
         f.confirm();
         assert.equal(f.live.prs[0].state, "closed");
         assert.equal(f.live.prs.length, 2);
-        assert.match(f.live.prs[1].body, /<!-- demo-reset:/);
+        assert.equal(f.live.prs[1].body, f.state.prs[0].body);
+        assert.match(f.live.prs[0].issueComments[0].body, /Demo reset replacement receipt/);
         assert.ok(f.output.some((line) => line.includes(f.live.prs[1].html_url)));
         assert.deepEqual(buildPlan(f.state, f.live, sha), []);
     }
@@ -348,7 +358,7 @@ test("partial creation label failure is reported and retries the known replaceme
     assert.deepEqual(buildPlan(f.state, f.live, sha), []);
 });
 
-test("retry after closing a reviewed PR recreates it; ambiguous known opens fail closed", () => {
+test("retry after closing a reviewed PR recreates it; a copied replacement identity fails closed", () => {
     const f = fixture();
     f.live.prs[0].reviews.push({ id: 1 });
     execute(buildPlan(f.state, f.live, sha)[0], f.request);
@@ -357,7 +367,7 @@ test("retry after closing a reviewed PR recreates it; ambiguous known opens fail
     const replacement = clone(f.live.prs[1]);
     replacement.number++;
     f.live.prs.push(replacement);
-    assert.throws(() => buildPlan(f.state, f.live, sha), /Multiple known open/);
+    assert.throws(() => buildPlan(f.state, f.live, sha), /Unknown open same-head/);
 });
 
 test("merged originals recreate after restoring missing heads, without trying to reopen", () => {
@@ -372,19 +382,19 @@ test("merged originals recreate after restoring missing heads, without trying to
     assert.deepEqual(buildPlan(f.state, f.live, sha), []);
 });
 
-test("known replacement base drift is restored; missing marker fails closed instead of selecting by recency", () => {
+test("known replacement base drift is restored; missing receipt fails closed instead of selecting by recency", () => {
     const f = fixture();
     f.live.prs[0].reviews.push({ id: 1 });
     f.confirm();
     f.live.prs[1].base.ref = "other";
     f.confirm();
     assert.equal(f.live.prs[1].base.ref, "main");
-    f.live.prs[1].body = "Marker removed";
-    assert.throws(() => preview(f.state, f.live, sha), /Ambiguous same-head/);
+    f.live.prs[0].issueComments = [];
+    assert.throws(() => preview(f.state, f.live, sha), /Unknown open same-head/);
     assert.equal(f.live.prs.length, 2);
 });
 
-test("lost creation response retries the already-created marked replacement safely", () => {
+test("lost creation response blocks retries without adopting an unverified replacement", () => {
     const f = fixture();
     f.live.prs[0].reviews.push({ id: 1 });
     f.services.apply = (action) => execute(action, (path, method, body) => {
@@ -395,9 +405,142 @@ test("lost creation response retries the already-created marked replacement safe
     assert.throws(() => f.confirm(), /Earlier actions may have applied.*Connection lost/);
     assert.equal(f.live.prs.length, 2);
     f.services.apply = (action) => execute(action, f.request, f.command, f.log);
+    assert.throws(() => f.confirm(), /Unknown open same-head/);
+    assert.equal(f.live.prs.length, 2);
+});
+
+test("replacement preview preserves exact body and explicitly shows the original-PR provenance receipt", () => {
+    const f = fixture();
+    f.state.prs[0].body = "Prepared body\n\nWith exact whitespace.\n";
+    f.live.prs[0].reviews.push({ id: 1 });
+    const action = preview(f.state, f.live, sha).actions.find((a) => a.kind === "restore-pr");
+    assert.equal(action.create.body.body, f.state.prs[0].body);
+    assert.equal(action.receipt.path, `${prefix}/issues/7/comments`);
+    assert.equal(action.receipt.method, "POST");
+    assert.equal(action.receipt.body.body, "Demo reset replacement receipt\n\n```json\n" + JSON.stringify({
+        version: 1, repo: REPO, originalNumber: 7, replacementNumber: "$created.number",
+        replacementNodeId: "$created.node_id", seededHead: { ref: "feature/seed", sha },
+        creator: { id: 100, login: "presenter" },
+    }, null, 2) + "\n```");
+    assert.deepEqual(action.receipt.author, f.live.actor);
+    f.confirm();
+    assert.equal(f.live.prs[1].body, f.state.prs[0].body);
+    assert.deepEqual(buildPlan(f.state, f.live, sha), []);
+});
+
+test("copied legacy hidden markers never establish replacement provenance", () => {
+    const f = fixture();
+    f.live.prs[0].state = "closed";
+    f.live.prs.push({ ...clone(f.live.prs[0]), number: 30, node_id: "PR_other", state: "open",
+        body: `\n\n<!-- demo-reset:${REPO}:7:${sha} -->` });
+    assert.throws(() => preview(f.state, f.live, sha), /Unknown open same-head/);
+    assert.deepEqual(f.calls, []);
+});
+
+test("copied/forged receipt identity, author, creator and seed bindings cannot authorize a candidate", () => {
+    for (const tamper of [
+        (f) => { f.live.prs[1].number++; },
+        (f) => { f.live.prs[1].node_id = "PR_copied_node"; },
+        (f) => { f.live.prs[1].user.id++; },
+        (f) => { f.live.prs[1].user.login = "different_creator"; },
+        (f) => { f.live.prs[0].issueComments[0].user.id++; },
+        (f) => { f.live.prs[0].issueComments[0].user.login = "forged_author"; },
+        (f) => { f.live.prs[0].issueComments[0].body = f.live.prs[0].issueComments[0].body.replace('"originalNumber": 7', '"originalNumber": 8'); },
+        (f) => { f.live.prs[0].issueComments[0].body = f.live.prs[0].issueComments[0].body.replace(sha, changed); },
+        (f) => { f.live.prs[0].issueComments[0].body = f.live.prs[0].issueComments[0].body.replace('"repo":', '"otherRepo":'); },
+        (f) => { f.live.prs[0].issueComments[0].body = "Demo reset replacement receipt\n\n```json\nnot-json\n```"; },
+        (f) => { f.live.prs[1].issueComments = f.live.prs[0].issueComments; f.live.prs[0].issueComments = []; },
+    ]) {
+        const f = fixture();
+        f.live.prs[0].reviews.push({ id: 1 });
+        f.confirm();
+        tamper(f);
+        const before = clone(f.live);
+        assert.throws(() => preview(f.state, f.live, sha), /Unknown open same-head/);
+        assert.deepEqual(f.live, before);
+    }
+});
+
+test("even multiple receipted open replacements block planning rather than selecting by recency", () => {
+    const f = fixture();
+    f.live.prs[0].reviews.push({ id: 1 });
+    f.confirm();
+    const extra = clone(f.live.prs[1]);
+    extra.number = 50;
+    extra.node_id = "PR_extra";
+    f.live.prs.push(extra);
+    const receipt = clone(f.live.prs[0].issueComments[0]);
+    receipt.id++;
+    receipt.body = receipt.body.replace('"replacementNumber": 21', '"replacementNumber": 50')
+        .replace('"replacementNodeId": "PR_21"', '"replacementNodeId": "PR_extra"');
+    f.live.prs[0].issueComments.push(receipt);
+    assert.throws(() => buildPlan(f.state, f.live, sha), /Multiple known open/);
+});
+
+test("receipt body/author and replacement immutable identities are fingerprinted", () => {
+    const f = fixture();
+    f.live.prs[0].reviews.push({ id: 1 });
+    f.confirm();
+    const before = preview(f.state, f.live, sha);
+    f.live.prs[0].issueComments.push({ id: 5000, body: "Visible receipt discussion", user: clone(f.live.actor) });
+    const after = preview(f.state, f.live, sha);
+    assert.notEqual(after.fingerprint, before.fingerprint);
+    const original = after.actions[0].expected.prs.find((pr) => pr.number === 7);
+    assert.deepEqual(original.issueComments, f.live.prs[0].issueComments);
+    const replacement = after.actions[0].expected.prs.find((pr) => pr.number === 21);
+    assert.equal(replacement.nodeId, f.live.prs[1].node_id);
+    assert.deepEqual(replacement.creator, f.live.actor);
+});
+
+test("receipt write failure without persistence blocks retry instead of duplicating or adopting", () => {
+    const f = fixture();
+    f.live.prs[0].reviews.push({ id: 1 });
+    f.services.apply = (action) => execute(action, (path, method, body) => {
+        if (path === `${prefix}/issues/7/comments` && method === "POST") throw new Error("Receipt write denied");
+        return f.request(path, method, body);
+    }, f.command, f.log);
+    assert.throws(() => f.confirm(), /Failed repair "Post visible replacement provenance receipt.*Receipt write denied/);
+    assert.equal(f.live.prs.length, 2);
+    assert.equal(f.live.prs[0].issueComments.length, 0);
+    assert.throws(() => f.confirm(), /Unknown open same-head.*reconcile provenance manually/);
+    assert.equal(f.live.prs.length, 2);
+});
+
+test("lost receipt response safely retries known replacement metadata without posting another receipt", () => {
+    const f = fixture();
+    f.live.prs[0].reviews.push({ id: 1 });
+    f.services.apply = (action) => execute(action, (path, method, body) => {
+        const result = f.request(path, method, body);
+        if (path === `${prefix}/issues/7/comments` && method === "POST") throw new Error("Receipt response lost");
+        return result;
+    }, f.command, f.log);
+    assert.throws(() => f.confirm(), /Receipt response lost/);
+    assert.equal(f.live.prs[0].issueComments.length, 1);
+    f.services.apply = (action) => execute(action, f.request, f.command, f.log);
     f.confirm();
     assert.equal(f.live.prs.length, 2);
+    assert.equal(f.live.prs[0].issueComments.length, 1);
     assert.deepEqual(buildPlan(f.state, f.live, sha), []);
+});
+
+test("changed creator or receipt author aborts execution before posting unverifiable provenance", () => {
+    for (const scenario of ["actor", "creator", "node"]) {
+        const f = fixture();
+        f.live.prs[0].reviews.push({ id: 1 });
+        const action = buildPlan(f.state, f.live, sha)[1];
+        if (scenario === "actor") f.live.actor.id++;
+        const request = (path, method, body) => {
+            const result = f.request(path, method, body);
+            if (path === `${prefix}/pulls` && method === "POST") {
+                if (scenario === "creator") result.user.id++;
+                if (scenario === "node") result.node_id = "PR_wrong";
+            }
+            return result;
+        };
+        assert.throws(() => execute(action, request, f.command, f.log),
+            /creator changed|Missing replacement PR response|Replacement identity changed/);
+        assert.equal(f.live.prs[0].issueComments.length, 0);
+    }
 });
 
 test("demo-created PR heads are checked before closure and branch deletion is atomic", () => {
@@ -451,7 +594,7 @@ test("snapshot collects review state; issue and alert resets retain existing beh
     });
     assert.equal(result.prs[0].reviews[0].state, "APPROVED");
     assert.equal(result.prs[0].reviewComments[0].id, 2);
-    assert.equal(calls.length, 13);
+    assert.equal(calls.length, 14);
     state.issues[0].assignees = ["presenter"];
     live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "Copilot" }] };
     live.alerts["code-scanning"] = [{ number: 1, state: "dismissed", assignees: [{ login: "Copilot" }] }];
@@ -514,6 +657,7 @@ test("snapshot explicitly collects every alert state and previews dismissed/auto
         return [];
     });
     live.repositoryId = f.live.repositoryId;
+    live.actor = f.live.actor;
     assert.deepEqual(live.alerts["code-scanning"].map((a) => a.number), [1, 2, 3]);
     assert.deepEqual(live.alerts.dependabot.map((a) => a.number), [4, 5, 6, 7]);
     assert.equal(calls.filter((path) => path.includes("/alerts?state=")).length, 8);

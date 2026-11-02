@@ -113,12 +113,30 @@ const headMatches = (pr, seed) => pr.head.repo?.full_name === REPO && pr.head.re
 const reviewed = (pr) => Boolean(pr.reviews?.length || pr.reviewComments?.length);
 const labelNames = (pr) => pr.labels.map((label) => label.name).sort();
 const equal = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
-const marker = (seed, sha) => `<!-- demo-reset:${REPO}:${seed.number}:${sha} -->`;
-const replacementBody = (seed, sha) => `${seed.body}\n\n${marker(seed, sha)}`;
-const replacementMatches = (pr, seed, sha) => headMatches(pr, seed) && pr.number > seed.number &&
-    (pr.body || "").includes(marker(seed, sha));
+const RECEIPT_TITLE = "Demo reset replacement receipt";
+const identity = (user) => ({ id: user?.id, login: user?.login });
+const validUser = (user) => Number.isSafeInteger(user?.id) && user.id > 0 && typeof user.login === "string" && user.login.length > 0;
+const receiptBody = (receipt) => `${RECEIPT_TITLE}\n\n\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\``;
+function replacementMatches(pr, seed, sha, original) {
+    if (!headMatches(pr, seed) || pr.number <= seed.number) return false;
+    return original.issueComments.some((comment) => {
+        if (!comment.body.startsWith(`${RECEIPT_TITLE}\n\n\`\`\`json\n`)) return false;
+        let receipt;
+        try {
+            receipt = JSON.parse(comment.body.slice(`${RECEIPT_TITLE}\n\n\`\`\`json\n`.length, -4));
+        } catch {
+            return false;
+        }
+        return comment.body === receiptBody(receipt) && equal(receipt, {
+            version: 1, repo: REPO, originalNumber: seed.number,
+            replacementNumber: pr.number, replacementNodeId: pr.node_id,
+            seededHead: { ref: seed.head, sha }, creator: identity(pr.user),
+        }) && equal(identity(comment.user), identity(pr.user));
+    });
+}
 const prGuard = (pr, sha = pr.head.sha) => ({
-    number: pr.number, head: pr.head.ref, repo: pr.head.repo?.full_name ?? null, sha,
+    number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
+    head: pr.head.ref, repo: pr.head.repo?.full_name ?? null, sha,
 });
 const requestAction = (label, path, method, body, guard) => ({
     kind: "request", label, path, method, body, ...(guard ? { guard } : {}),
@@ -127,7 +145,7 @@ const requestAction = (label, path, method, body, guard) => ({
 function metadataActions(seed, pr, sha, full = false) {
     const prefix = `repos/${REPO}`;
     const actions = [];
-    const body = pr.number === seed.number ? seed.body : replacementBody(seed, sha);
+    const body = seed.body;
     const guard = prGuard(pr, sha);
     if (full || pr.title !== seed.title || (pr.body || "") !== body || pr.base.ref !== seed.base) {
         actions.push(requestAction(`Restore title/body/base on prepared PR #${pr.number}`,
@@ -162,16 +180,18 @@ function normalizedState(state) {
 export function preview(state, live, baselineSha) {
     const actions = buildPlan(state, live, baselineSha);
     const normalized = {
-        baseline: normalizedState(state), baselineSha, repositoryId: live.repositoryId,
+        baseline: normalizedState(state), baselineSha, repositoryId: live.repositoryId, actor: live.actor,
         branches: Object.fromEntries(sortedEntries(live.branches)),
         prs: [...live.prs].sort(byNumber).map((pr) => ({
-            number: pr.number, state: pr.state, title: pr.title, body: pr.body || "", draft: pr.draft,
+            number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
+            state: pr.state, title: pr.title, body: pr.body || "", draft: pr.draft,
             merged_at: pr.merged_at, head: {
                 ref: pr.head.ref, sha: pr.head.sha, repo: pr.head.repo?.full_name,
             }, base: { ref: pr.base.ref, sha: pr.base.sha, repo: pr.base.repo?.full_name },
             labels: labelNames(pr),
             reviews: [...pr.reviews].sort((a, b) => a.id - b.id),
             reviewComments: [...pr.reviewComments].sort((a, b) => a.id - b.id),
+            issueComments: [...pr.issueComments].sort((a, b) => a.id - b.id),
         })),
         issues: live.issues.filter((issue) => state.issues.some((seed) => seed.number === issue.number))
             .sort(byNumber).map(({ number, state, assignees }) => ({
@@ -191,6 +211,8 @@ export function preview(state, live, baselineSha) {
             "Fixed alerts require a rescan; replacing reviewed prepared PRs creates new URLs but preserves old history.",
             "Reopening auto-dismissed alerts may override auto-triage decisions.",
             "Stop all writers: refs use atomic compare-and-swap, but GitHub PR/issue/alert mutations are not transactional.",
+            "Fresh prepared PRs keep the exact recorded body. A visible provenance receipt is posted on the original PR.",
+            "A created PR without a verified provenance receipt blocks automatic retries; inspect and reconcile it manually.",
         ],
     };
     return canonical({ ...payload,
@@ -212,7 +234,9 @@ export function buildPlan(state, live, baselineSha) {
         throw new Error("Invalid live branch SHA; refusing an incomplete reset.");
     }
     for (const pr of live.prs) {
-        if (!/^[a-f0-9]{40}$/.test(pr.head.sha) || !Array.isArray(pr.reviews) || !Array.isArray(pr.reviewComments)) {
+        if (!/^[a-f0-9]{40}$/.test(pr.head.sha) || !Array.isArray(pr.reviews) || !Array.isArray(pr.reviewComments) ||
+            !Array.isArray(pr.issueComments) || typeof pr.node_id !== "string" || !pr.node_id || !validUser(pr.user) ||
+            !pr.issueComments.every((c) => Number.isSafeInteger(c.id) && typeof c.body === "string" && validUser(c.user))) {
             throw new Error(`Missing PR head/review state for #${pr.number}; refusing an incomplete reset.`);
         }
     }
@@ -221,15 +245,17 @@ export function buildPlan(state, live, baselineSha) {
     const prefix = `repos/${state.repo}`;
     const wanted = { main: baselineSha, ...state.branches };
     const seeds = [...state.prs].sort(byNumber);
+    if (seeds.length && !validUser(live.actor)) throw new Error("Missing authenticated receipt author identity.");
     const identities = new Map(seeds.map((seed) => {
         const sha = state.branches[seed.head];
         const original = live.prs.find((pr) => pr.number === seed.number);
-        if (original && !headMatches(original, seed)) throw new Error(`Recorded PR #${seed.number} changed identity.`);
+        if (!original || !headMatches(original, seed)) throw new Error(`Recorded PR #${seed.number} missing or changed identity.`);
         const candidates = live.prs.filter((pr) => headMatches(pr, seed));
-        if (candidates.some((pr) => pr !== original && !replacementMatches(pr, seed, sha))) {
-            throw new Error(`Ambiguous same-head PR history for prepared PR #${seed.number}; refusing to modify it.`);
+        if (candidates.some((pr) => pr.state === "open" && pr !== original && !replacementMatches(pr, seed, sha, original))) {
+            throw new Error(`Unknown open same-head PR for prepared PR #${seed.number}; missing/invalid provenance receipt. ` +
+                "Inspect the candidate and reconcile provenance manually before retrying; no PR will be adopted by recency.");
         }
-        const known = candidates.filter((pr) => pr === original || replacementMatches(pr, seed, sha)).sort(byNumber);
+        const known = candidates.filter((pr) => pr === original || replacementMatches(pr, seed, sha, original)).sort(byNumber);
         if (known.filter((pr) => pr.state === "open").length > 1) {
             throw new Error(`Multiple known open prepared PRs for #${seed.number}; review manually.`);
         }
@@ -267,11 +293,25 @@ export function buildPlan(state, live, baselineSha) {
         const prior = !open && reopenable.length === 1 ? reopenable[0] : undefined;
         const create = requestAction(`Create fresh prepared PR for #${seed.number}`, `${prefix}/pulls`, "POST", {
             head: seed.head, base: seed.base, title: seed.title,
-            body: replacementBody(seed, sha), draft: seed.draft,
+            body: seed.body, draft: seed.draft,
         });
+        const receipt = {
+            kind: "provenance-receipt", label: `Post visible replacement provenance receipt on original PR #${seed.number}`,
+            path: `${prefix}/issues/${seed.number}/comments`, method: "POST",
+            body: { body: receiptBody({
+                version: 1, repo: REPO, originalNumber: seed.number,
+                replacementNumber: "$created.number", replacementNodeId: "$created.node_id",
+                seededHead: { ref: seed.head, sha }, creator: identity(live.actor),
+            }) },
+            author: identity(live.actor),
+            guard: prGuard(live.prs.find((pr) => pr.number === seed.number), sha),
+            replacementGuard: { number: "$created.number", nodeId: "$created.node_id",
+                creator: identity(live.actor), head: seed.head, sha, repo: REPO },
+        };
         const repairs = [requestAction("Restore replacement labels",
             `${prefix}/issues/$created.number/labels`, "PUT", { labels: [...seed.labels].sort() },
-            { number: "$created.number", head: seed.head, sha, repo: REPO })];
+            { number: "$created.number", nodeId: "$created.node_id", creator: identity(live.actor),
+                head: seed.head, sha, repo: REPO })];
         actions.push({
             kind: "restore-pr", label: `${prior ? "Reopen" : "Recreate"} seeded PR: ${seed.title}`,
             headGuard: { head: seed.head, sha, repo: REPO },
@@ -279,8 +319,8 @@ export function buildPlan(state, live, baselineSha) {
                 action: requestAction(`Reopen prepared PR #${prior.number}`, `${prefix}/pulls/${prior.number}`,
                     "PATCH", { state: "open" }, prGuard(prior, sha)),
                 repairs: metadataActions(seed, prior, sha, true),
-                onHTTP422: { create, repairs },
-            } } : { create, repairs }),
+                onHTTP422: { create, receipt, repairs },
+            } } : { create, receipt, repairs }),
         });
     }
     for (const [name, sha] of sortedEntries(live.branches)) {
@@ -326,6 +366,8 @@ export function snapshot(read = pages) {
                 ({ id, state, body, commit_id, submitted_at }) => ({ id, state, body, commit_id, submitted_at })),
             reviewComments: read(`${prefix}/pulls/${pr.number}/comments?per_page=100`).map(
                 ({ id, body, updated_at, commit_id }) => ({ id, body, updated_at, commit_id })),
+            issueComments: read(`${prefix}/issues/${pr.number}/comments?per_page=100`).map(
+                ({ id, body, user, updated_at }) => ({ id, body, user: identity(user), updated_at })),
         })),
         issues: read(`${prefix}/issues?state=all&per_page=100`).filter((issue) => !issue.pull_request),
         alerts: {
@@ -357,6 +399,17 @@ export function execute(action, request = api, command = run, log = console.log)
         command("gh", ["pr", "ready", String(action.number), "--repo", REPO, ...(action.draft ? ["--undo"] : [])]);
         return;
     }
+    if (action.kind === "provenance-receipt") {
+        if (!equal(identity(request("user")), action.author)) throw new Error("Receipt author changed since preview.");
+        const pr = request(`repos/${REPO}/pulls/${action.replacementGuard.number}`);
+        if (!equal(prGuard(pr), action.replacementGuard)) throw new Error("Replacement identity changed before receipt.");
+        const comment = request(action.path, action.method, action.body);
+        if (!Number.isSafeInteger(comment?.id) || comment.body !== action.body.body ||
+            !equal(identity(comment.user), action.author)) {
+            throw new Error("Receipt response was not verifiable; receipt may have applied. Preview again before retrying.");
+        }
+        return;
+    }
     if (action.kind !== "restore-pr") throw new Error(`Unknown reset action: ${action.kind}`);
     const ref = request(`repos/${REPO}/git/ref/heads/${branchPath(action.headGuard.head)}`);
     if (ref.object.sha !== action.headGuard.sha) {
@@ -383,14 +436,25 @@ export function execute(action, request = api, command = run, log = console.log)
         }
         creation = action.reopen.onHTTP422;
     }
+    if (!equal(identity(request("user")), creation.receipt.author)) {
+        throw new Error("Replacement creator changed since preview.");
+    }
     const created = request(creation.create.path, creation.create.method, creation.create.body);
-    if (!Number.isSafeInteger(created?.number) || !created?.html_url) {
+    if (!Number.isSafeInteger(created?.number) || !created?.html_url || typeof created.node_id !== "string" ||
+        !created.node_id || !equal(identity(created.user), creation.receipt.author)) {
         throw new Error("Missing replacement PR response. Creation may have applied; preview again before retrying.");
     }
     log(`  Seeded PR replacement: ${created.html_url}`);
+    const receipt = creation.receipt;
+    const binding = JSON.parse(receipt.body.body.slice(`${RECEIPT_TITLE}\n\n\`\`\`json\n`.length, -4));
+    binding.replacementNumber = created.number;
+    binding.replacementNodeId = created.node_id;
+    executeRepair({ ...receipt, body: { body: receiptBody(binding) },
+        replacementGuard: { ...receipt.replacementGuard, number: created.number, nodeId: created.node_id },
+    }, request, command, log);
     for (const repair of creation.repairs) executeRepair({
         ...repair, path: repair.path.replace("$created.number", String(created.number)),
-        guard: { ...repair.guard, number: created.number },
+        guard: { ...repair.guard, number: created.number, nodeId: created.node_id },
     }, request, command, log);
 }
 
@@ -482,7 +546,8 @@ export function main(args = process.argv.slice(2), {
     if (JSON.stringify(state) !== JSON.stringify(remoteState)) {
         throw new Error("Local baseline differs from demo-baseline. Update this checkout before resetting.");
     }
-    const live = () => ({ ...readSnapshot(), repositoryId: repo.node_id });
+    const live = () => ({ ...readSnapshot(), repositoryId: repo.node_id,
+        ...(state.prs.length ? { actor: identity(request("user")) } : {}) });
     const plan = preview(state, live(), tag.object.sha);
     if (args.includes("--preview-json")) {
         log(JSON.stringify(plan));
