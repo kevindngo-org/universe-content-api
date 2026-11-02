@@ -43,8 +43,24 @@ function fixture() {
                 const name = decodeURIComponent(path.split("/git/ref/heads/")[1]);
                 return { object: { sha: live.branches[name] } };
             }
+            for (const pr of live.prs) {
+                if (path.startsWith(`${prefix}/pulls/${pr.number}/reviews?`)) return clone(pr.reviews);
+                if (path.startsWith(`${prefix}/pulls/${pr.number}/comments?`)) return clone(pr.reviewComments);
+                if (path.startsWith(`${prefix}/issues/${pr.number}/comments?`)) return clone(pr.issueComments);
+            }
+            for (const [kind, alerts] of Object.entries(live.alerts)) {
+                const alert = alerts.find((alert) => path === `${prefix}/${kind}/alerts/${alert.number}`);
+                if (alert) return clone(alert);
+            }
             const pr = live.prs.find((pr) => path === `${prefix}/pulls/${pr.number}`);
             if (pr) return clone(pr);
+        }
+        for (const [kind, alerts] of Object.entries(live.alerts)) {
+            const alert = alerts.find((alert) => path === `${prefix}/${kind}/alerts/${alert.number}`);
+            if (alert && method === "PATCH") {
+                Object.assign(alert, body, { updated_at: "2026-11-02T00:00:00Z" });
+                return clone(alert);
+            }
         }
         if (path === "graphql") {
             const { repositoryId, refUpdates } = body.variables.input;
@@ -334,7 +350,7 @@ test("PR head drift blocks closing, reopening and metadata edits, even when guar
         if (scenario === "metadata") f.live.prs[0].title = "Changed";
         const action = JSON.parse(JSON.stringify(buildPlan(f.state, f.live, sha)[0]));
         f.live.prs[0].head.sha = changed;
-        assert.throws(() => execute(action, f.request), /PR head changed/);
+        assert.throws(() => execute(action, f.request), /PR head\/review\/metadata changed/);
         assert.ok(f.calls.every((call) => call.method === "GET"));
     }
 });
@@ -538,7 +554,7 @@ test("changed creator or receipt author aborts execution before posting unverifi
             return result;
         };
         assert.throws(() => execute(action, request, f.command, f.log),
-            /creator changed|Missing replacement PR response|Replacement identity changed/);
+            /creator changed|Missing replacement PR response|PR head\/review\/metadata changed/);
         assert.equal(f.live.prs[0].issueComments.length, 0);
     }
 });
@@ -594,13 +610,13 @@ test("snapshot collects review state; issue and alert resets retain existing beh
     });
     assert.equal(result.prs[0].reviews[0].state, "APPROVED");
     assert.equal(result.prs[0].reviewComments[0].id, 2);
-    assert.equal(calls.length, 14);
+    assert.equal(calls.length, 22);
     state.issues[0].assignees = ["presenter"];
     live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "Copilot" }] };
     live.alerts["code-scanning"] = [{ number: 1, state: "dismissed", assignees: [{ login: "Copilot" }] }];
     assert.deepEqual(buildPlan(state, live, sha).map((a) => a.body), [
         { state: "open" }, { assignees: ["Copilot"] }, { assignees: ["presenter"] },
-        { state: "open" }, { assignees: [] },
+        { state: "open", assignees: [] },
     ]);
 });
 
@@ -660,7 +676,7 @@ test("snapshot explicitly collects every alert state and previews dismissed/auto
     live.actor = f.live.actor;
     assert.deepEqual(live.alerts["code-scanning"].map((a) => a.number), [1, 2, 3]);
     assert.deepEqual(live.alerts.dependabot.map((a) => a.number), [4, 5, 6, 7]);
-    assert.equal(calls.filter((path) => path.includes("/alerts?state=")).length, 8);
+    assert.equal(calls.filter((path) => path.includes("/alerts?state=")).length, 16);
     const plan = preview(f.state, live, sha);
     assert.deepEqual(plan.actions.filter((a) => a.method === "PATCH").map((a) => a.path), [
         `${prefix}/code-scanning/alerts/2`, `${prefix}/dependabot/alerts/5`, `${prefix}/dependabot/alerts/7`,
@@ -714,4 +730,102 @@ test("missing scope, invalid baseline, missing seeded issue and incomplete PR st
     assert.throws(() => buildPlan(state, { ...live, issues: [] }, sha), /missing/);
     delete live.prs[0].reviews;
     assert.throws(() => buildPlan(state, live, sha), /head\/review state/);
+});
+
+test("two full alert sweeps reject disappearance, transitions, assignments and updated-time drift", () => {
+    for (const kind of ["code-scanning", "dependabot"]) {
+        const statesPerSweep = 4;
+        for (const change of ["missing", "state", "assignee", "updated"]) {
+            let calls = 0;
+            assert.throws(() => collectAlerts(kind, (path) => {
+                const sweep = Math.floor(calls++ / statesPerSweep);
+                const state = new URLSearchParams(path.split("?")[1]).get("state");
+                const alert = { number: 10, state: "open", assignees: [], updated_at: "2026-11-01T00:00:00Z" };
+                if (sweep) {
+                    if (change === "missing") return [];
+                    if (change === "state") alert.state = "dismissed";
+                    if (change === "assignee") alert.assignees = [{ login: "new-writer" }];
+                    if (change === "updated") alert.updated_at = "2026-11-01T00:01:00Z";
+                }
+                return state === alert.state || (state === "closed" && alert.state === "dismissed") ? [alert] : [];
+            }), /Changed .* alert inventory between complete sweeps/);
+        }
+    }
+});
+
+test("filter-transition disappearance in first sweep is detected when second inventory observes the alert", () => {
+    let calls = 0;
+    assert.throws(() => collectAlerts("dependabot", (path) => {
+        const sweep = Math.floor(calls++ / 4);
+        const state = new URLSearchParams(path.split("?")[1]).get("state");
+        // First sweep misses an alert that became open after the open query and before dismissed query.
+        return sweep && state === "open" ? [{ number: 1, state: "open", updated_at: "2026-11-01T00:00:00Z" }] : [];
+    }), /Changed dependabot alert inventory/);
+});
+
+test("new mid-run PR reviews or metadata abort repairs and preserve concurrent work", () => {
+    for (const mutate of [
+        (pr) => pr.reviews.push({ id: 2, state: "APPROVED" }),
+        (pr) => pr.reviewComments.push({ id: 3, body: "New review comment" }),
+        (pr) => { pr.body = "Concurrent body edit"; },
+        (pr) => { pr.title = "Concurrent title edit"; },
+        (pr) => { pr.labels.push({ name: "concurrent" }); },
+        (pr) => { pr.base.ref = "other"; },
+        (pr) => { pr.draft = false; },
+    ]) {
+        const f = fixture();
+        Object.assign(f.live.prs[0], { title: "Needs restoration", draft: true, labels: [] });
+        f.services.apply = (action) => {
+            execute(action, f.request, f.command, f.log);
+            if (action.method === "PATCH" && action.body.title === "Seed") mutate(f.live.prs[0]);
+        };
+        assert.throws(() => f.confirm(), /Failed action "Restore labels.*Earlier actions may have applied.*PR head\/review\/metadata changed/);
+        assert.ok(!f.calls.some((c) => c.method === "PUT"));
+    }
+});
+
+test("review arriving after planned closure blocks replacement creation", () => {
+    const f = fixture();
+    f.live.prs[0].reviews.push({ id: 1, state: "APPROVED" });
+    f.services.apply = (action) => {
+        execute(action, f.request, f.command, f.log);
+        if (action.method === "PATCH" && action.body.state === "closed") {
+            f.live.prs[0].reviews.push({ id: 2, state: "COMMENTED" });
+        }
+    };
+    assert.throws(() => f.confirm(), /Failed action "Recreate seeded PR.*Earlier actions may have applied.*PR head\/review\/metadata changed/);
+    assert.equal(f.live.prs.length, 1);
+    assert.equal(f.live.prs[0].state, "closed");
+});
+
+test("alert assignment/state/time drift immediately before write aborts without erasing new assignments", () => {
+    for (const mutate of [
+        (alert) => { alert.assignees.push({ login: "concurrent" }); },
+        (alert) => { alert.state = "fixed"; },
+        (alert) => { alert.updated_at = "2026-11-01T00:01:00Z"; },
+    ]) {
+        const f = fixture();
+        f.live.alerts.dependabot = [{ number: 1, state: "dismissed",
+            assignees: [{ login: "old" }], updated_at: "2026-11-01T00:00:00Z" }];
+        f.services.apply = (action) => {
+            if (action.alertGuard) mutate(f.live.alerts.dependabot[0]);
+            execute(action, f.request, f.command, f.log);
+        };
+        assert.throws(() => f.confirm(), /Failed action "Restore dependabot alert.*Earlier actions may have applied.*Alert state\/assignees\/update time changed/);
+        assert.ok(!f.calls.some((c) => c.method === "PATCH"));
+    }
+});
+
+test("combined guarded alert repair accounts for reopen and assignment clearing in one write", () => {
+    const f = fixture();
+    f.live.alerts.dependabot = [{ number: 1, state: "auto_dismissed",
+        assignees: [{ login: "old" }], updated_at: "2026-11-01T00:00:00Z" }];
+    const actions = buildPlan(f.state, f.live, sha);
+    assert.equal(actions.length, 1);
+    assert.deepEqual(actions[0].body, { state: "open", assignees: [] });
+    assert.equal(actions[0].alertGuard.updated_at, "2026-11-01T00:00:00Z");
+    f.confirm();
+    assert.equal(f.live.alerts.dependabot[0].state, "open");
+    assert.deepEqual(f.live.alerts.dependabot[0].assignees, []);
+    assert.equal(f.calls.filter((c) => c.method === "PATCH").length, 1);
 });

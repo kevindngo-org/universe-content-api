@@ -43,6 +43,22 @@ export function alertPages(path, read = pages) {
 }
 
 export function collectAlerts(kind, read = pages) {
+    const first = collectAlertSweep(kind, read);
+    const second = collectAlertSweep(kind, read);
+    if (!equal(first, second)) throw new Error(`Changed ${kind} alert inventory between complete sweeps; preview again after stopping writers.`);
+    return second;
+}
+
+function alertState(alert) {
+    return {
+        number: alert.number, id: alert.id ?? null, node_id: alert.node_id ?? null, state: alert.state,
+        assignees: (alert.assignees || []).map(({ login }) => ({ login }))
+            .sort((a, b) => compareText(a.login, b.login)),
+        updated_at: alert.updated_at ?? null,
+    };
+}
+
+function collectAlertSweep(kind, read) {
     const states = kind === "code-scanning" ? ["open", "closed", "dismissed", "fixed"] :
         kind === "dependabot" ? ["open", "dismissed", "fixed", "auto_dismissed"] : undefined;
     if (!states) throw new Error(`Unsupported alert kind: ${kind}`);
@@ -58,11 +74,7 @@ export function collectAlerts(kind, read = pages) {
                     !alert.assignees.every((a) => typeof a.login === "string")))) {
                 throw new Error(`Invalid or inconsistent ${kind} alert in ${state} response; preview again after stopping writers.`);
             }
-            const normalized = {
-                number: alert.number, state: alert.state,
-                assignees: (alert.assignees || []).map(({ login }) => ({ login }))
-                    .sort((a, b) => compareText(a.login, b.login)),
-            };
+            const normalized = alertState(alert);
             const prior = found.get(alert.number);
             if (prior && !equal(prior, normalized)) {
                 throw new Error(`Inconsistent ${kind} alert #${alert.number} across observations; preview again after stopping writers.`);
@@ -137,6 +149,14 @@ function replacementMatches(pr, seed, sha, original) {
 const prGuard = (pr, sha = pr.head.sha) => ({
     number: pr.number, nodeId: pr.node_id, creator: identity(pr.user),
     head: pr.head.ref, repo: pr.head.repo?.full_name ?? null, sha,
+    state: pr.state, merged_at: pr.merged_at ?? null, title: pr.title, body: pr.body || "",
+    base: pr.base.ref, draft: pr.draft, labels: labelNames(pr),
+    reviews: pr.reviews.map(({ id, state, body, commit_id, submitted_at }) =>
+        canonical({ id, state, body, commit_id, submitted_at })).sort((a, b) => a.id - b.id),
+    reviewComments: pr.reviewComments.map(({ id, body, updated_at, commit_id }) =>
+        canonical({ id, body, updated_at, commit_id })).sort((a, b) => a.id - b.id),
+    issueComments: pr.issueComments.map(({ id, body, user, updated_at }) =>
+        canonical({ id, body, user: identity(user), updated_at })).sort((a, b) => a.id - b.id),
 });
 const requestAction = (label, path, method, body, guard) => ({
     kind: "request", label, path, method, body, ...(guard ? { guard } : {}),
@@ -146,18 +166,20 @@ function metadataActions(seed, pr, sha, full = false) {
     const prefix = `repos/${REPO}`;
     const actions = [];
     const body = seed.body;
-    const guard = prGuard(pr, sha);
+    const expected = structuredClone(pr);
     if (full || pr.title !== seed.title || (pr.body || "") !== body || pr.base.ref !== seed.base) {
         actions.push(requestAction(`Restore title/body/base on prepared PR #${pr.number}`,
-            `${prefix}/pulls/${pr.number}`, "PATCH", { title: seed.title, body, base: seed.base }, guard));
+            `${prefix}/pulls/${pr.number}`, "PATCH", { title: seed.title, body, base: seed.base }, prGuard(expected, sha)));
+        Object.assign(expected, { title: seed.title, body, base: { ref: seed.base } });
     }
     if (full || !equal(labelNames(pr), [...seed.labels].sort())) {
         actions.push(requestAction(`Restore labels on prepared PR #${pr.number}`,
-            `${prefix}/issues/${pr.number}/labels`, "PUT", { labels: [...seed.labels].sort() }, guard));
+            `${prefix}/issues/${pr.number}/labels`, "PUT", { labels: [...seed.labels].sort() }, prGuard(expected, sha)));
+        expected.labels = seed.labels.map((name) => ({ name }));
     }
     if (pr.draft !== seed.draft) {
         actions.push({ kind: "draft-pr", label: `Restore draft status on prepared PR #${pr.number}`,
-            number: pr.number, draft: seed.draft, guard });
+            number: pr.number, draft: seed.draft, guard: prGuard(expected, sha) });
     }
     return actions;
 }
@@ -198,9 +220,7 @@ export function preview(state, live, baselineSha) {
                 number, state, assignees: assignees.map((a) => a.login).sort(),
             })),
         alerts: Object.fromEntries(sortedEntries(live.alerts).map(([kind, alerts]) => [kind,
-            [...alerts].sort(byNumber).map(({ number, state, assignees }) => ({
-                number, state, assignees: (assignees || []).map((a) => a.login).sort(),
-            })),
+            [...alerts].sort(byNumber).map(alertState),
         ])),
     };
     const payload = {
@@ -291,10 +311,19 @@ export function buildPlan(state, live, baselineSha) {
             `${prefix}/pulls/${open.number}`, "PATCH", { state: "closed" }, prGuard(open, sha));
         const reopenable = known.filter((pr) => pr.state === "closed" && !pr.merged_at && !reviewed(pr));
         const prior = !open && reopenable.length === 1 ? reopenable[0] : undefined;
+        const original = live.prs.find((pr) => pr.number === seed.number);
+        const originalAfterClose = { ...original, state: open?.number === seed.number ? "closed" : original.state };
+        const replacementExpected = {
+            ...original, number: "$created.number", node_id: "$created.node_id", user: identity(live.actor),
+            state: "open", merged_at: null, title: seed.title, body: seed.body, draft: seed.draft,
+            labels: [], reviews: [], reviewComments: [], issueComments: [],
+            head: { ref: seed.head, sha, repo: { full_name: REPO } }, base: { ref: seed.base },
+        };
+        const replacementGuard = prGuard(replacementExpected, sha);
         const create = requestAction(`Create fresh prepared PR for #${seed.number}`, `${prefix}/pulls`, "POST", {
             head: seed.head, base: seed.base, title: seed.title,
             body: seed.body, draft: seed.draft,
-        });
+        }, prGuard(originalAfterClose, sha));
         const receipt = {
             kind: "provenance-receipt", label: `Post visible replacement provenance receipt on original PR #${seed.number}`,
             path: `${prefix}/issues/${seed.number}/comments`, method: "POST",
@@ -304,21 +333,19 @@ export function buildPlan(state, live, baselineSha) {
                 seededHead: { ref: seed.head, sha }, creator: identity(live.actor),
             }) },
             author: identity(live.actor),
-            guard: prGuard(live.prs.find((pr) => pr.number === seed.number), sha),
-            replacementGuard: { number: "$created.number", nodeId: "$created.node_id",
-                creator: identity(live.actor), head: seed.head, sha, repo: REPO },
+            guard: prGuard(originalAfterClose, sha),
+            replacementGuard,
         };
         const repairs = [requestAction("Restore replacement labels",
             `${prefix}/issues/$created.number/labels`, "PUT", { labels: [...seed.labels].sort() },
-            { number: "$created.number", nodeId: "$created.node_id", creator: identity(live.actor),
-                head: seed.head, sha, repo: REPO })];
+            replacementGuard)];
         actions.push({
             kind: "restore-pr", label: `${prior ? "Reopen" : "Recreate"} seeded PR: ${seed.title}`,
             headGuard: { head: seed.head, sha, repo: REPO },
             ...(prior ? { reopen: {
                 action: requestAction(`Reopen prepared PR #${prior.number}`, `${prefix}/pulls/${prior.number}`,
                     "PATCH", { state: "open" }, prGuard(prior, sha)),
-                repairs: metadataActions(seed, prior, sha, true),
+                repairs: metadataActions(seed, { ...prior, state: "open" }, sha, true),
                 onHTTP422: { create, receipt, repairs },
             } } : { create, receipt, repairs }),
         });
@@ -343,14 +370,14 @@ export function buildPlan(state, live, baselineSha) {
     }
     for (const [kind, alerts] of sortedEntries(live.alerts)) {
         for (const alert of [...alerts].sort(byNumber)) {
-            if (["dismissed", "auto_dismissed"].includes(alert.state)) {
-                request(`Reopen ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
-                    "PATCH", { state: "open" });
-            }
-            if (alert.assignees?.length) {
-                request(`Clear assignees on ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
-                    "PATCH", { assignees: [] });
-            }
+            const body = {
+                ...(["dismissed", "auto_dismissed"].includes(alert.state) ? { state: "open" } : {}),
+                ...(alert.assignees?.length ? { assignees: [] } : {}),
+            };
+            if (Object.keys(body).length) actions.push({
+                ...requestAction(`Restore ${kind} alert #${alert.number}`, `${prefix}/${kind}/alerts/${alert.number}`,
+                    "PATCH", body), alertGuard: alertState(alert),
+            });
         }
     }
     return actions;
@@ -361,13 +388,7 @@ export function snapshot(read = pages) {
     return {
         branches: Object.fromEntries(read(`${prefix}/branches?per_page=100`).map((b) => [b.name, b.commit.sha])),
         prs: read(`${prefix}/pulls?state=all&per_page=100`).map((pr) => ({
-            ...pr,
-            reviews: read(`${prefix}/pulls/${pr.number}/reviews?per_page=100`).map(
-                ({ id, state, body, commit_id, submitted_at }) => ({ id, state, body, commit_id, submitted_at })),
-            reviewComments: read(`${prefix}/pulls/${pr.number}/comments?per_page=100`).map(
-                ({ id, body, updated_at, commit_id }) => ({ id, body, updated_at, commit_id })),
-            issueComments: read(`${prefix}/issues/${pr.number}/comments?per_page=100`).map(
-                ({ id, body, user, updated_at }) => ({ id, body, user: identity(user), updated_at })),
+            ...pr, ...prDiscussion(pr.number, read),
         })),
         issues: read(`${prefix}/issues?state=all&per_page=100`).filter((issue) => !issue.pull_request),
         alerts: {
@@ -377,12 +398,45 @@ export function snapshot(read = pages) {
     };
 }
 
+function prDiscussion(number, read) {
+    const prefix = `repos/${REPO}`;
+    return {
+        reviews: read(`${prefix}/pulls/${number}/reviews?per_page=100`).map(
+            ({ id, state, body, commit_id, submitted_at }) => canonical({ id, state, body, commit_id, submitted_at })),
+        reviewComments: read(`${prefix}/pulls/${number}/comments?per_page=100`).map(
+            ({ id, body, updated_at, commit_id }) => canonical({ id, body, updated_at, commit_id })),
+        issueComments: read(`${prefix}/issues/${number}/comments?per_page=100`).map(
+            ({ id, body, user, updated_at }) => canonical({ id, body, user: identity(user), updated_at })),
+    };
+}
+
+function requestPages(path, request) {
+    const result = [];
+    for (let page = 1; ; page++) {
+        const batch = request(`${path}&page=${page}`);
+        if (!Array.isArray(batch)) throw new Error(`Invalid paginated guard response: ${path}`);
+        result.push(...batch);
+        if (batch.length < 100) return result;
+    }
+}
+
+function checkPRGuard(guard, request) {
+    const pr = request(`repos/${REPO}/pulls/${guard.number}`);
+    const current = { ...pr, ...prDiscussion(guard.number, (path) => requestPages(path, request)) };
+    if (!equal(prGuard(current), guard)) {
+        throw new Error(`PR head/review/metadata changed since preview: #${guard.number}.`);
+    }
+}
+
 export function execute(action, request = api, command = run, log = console.log) {
     if (action.kind === "verify-state") return;
     if (action.guard) {
-        const pr = request(`repos/${REPO}/pulls/${action.guard.number}`);
-        const actual = prGuard(pr);
-        if (!equal(actual, action.guard)) throw new Error(`PR head changed since preview: ${action.label}.`);
+        checkPRGuard(action.guard, request);
+    }
+    if (action.alertGuard) {
+        if (!equal(alertState(request(action.path)), action.alertGuard)) {
+            throw new Error(`Alert state/assignees/update time changed since preview: ${action.label}.`);
+        }
     }
     if (action.kind === "ref-update") {
         const result = request(action.path, action.method, action.body);
@@ -401,8 +455,7 @@ export function execute(action, request = api, command = run, log = console.log)
     }
     if (action.kind === "provenance-receipt") {
         if (!equal(identity(request("user")), action.author)) throw new Error("Receipt author changed since preview.");
-        const pr = request(`repos/${REPO}/pulls/${action.replacementGuard.number}`);
-        if (!equal(prGuard(pr), action.replacementGuard)) throw new Error("Replacement identity changed before receipt.");
+        checkPRGuard(action.replacementGuard, request);
         const comment = request(action.path, action.method, action.body);
         if (!Number.isSafeInteger(comment?.id) || comment.body !== action.body.body ||
             !equal(identity(comment.user), action.author)) {
@@ -421,8 +474,7 @@ export function execute(action, request = api, command = run, log = console.log)
         // Only a 422 from the reopen request selects the explicitly previewed fallback.
         // Guard or repair failures must never create a second PR.
         const { guard, ...reopen } = action.reopen.action;
-        const current = request(`repos/${REPO}/pulls/${guard.number}`);
-        if (!equal(prGuard(current), guard)) throw new Error(`PR head changed since preview: ${reopen.label}.`);
+        checkPRGuard(guard, request);
         try {
             execute(reopen, request, command, log);
         } catch (error) {
@@ -439,6 +491,7 @@ export function execute(action, request = api, command = run, log = console.log)
     if (!equal(identity(request("user")), creation.receipt.author)) {
         throw new Error("Replacement creator changed since preview.");
     }
+    checkPRGuard(creation.create.guard, request);
     const created = request(creation.create.path, creation.create.method, creation.create.body);
     if (!Number.isSafeInteger(created?.number) || !created?.html_url || typeof created.node_id !== "string" ||
         !created.node_id || !equal(identity(created.user), creation.receipt.author)) {
