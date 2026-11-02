@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { alertPages, buildPlan, execute, main, preview, REPO, snapshot, validateState } from "../demo/remote-reset.mjs";
+import { alertPages, buildPlan, collectAlerts, execute, main, pages, preview, REPO, snapshot, validateState } from "../demo/remote-reset.mjs";
 
 const sha = "a".repeat(40);
 const changed = "b".repeat(40);
@@ -451,7 +451,7 @@ test("snapshot collects review state; issue and alert resets retain existing beh
     });
     assert.equal(result.prs[0].reviews[0].state, "APPROVED");
     assert.equal(result.prs[0].reviewComments[0].id, 2);
-    assert.equal(calls.length, 7);
+    assert.equal(calls.length, 13);
     state.issues[0].assignees = ["presenter"];
     live.issues[0] = { number: 1, state: "closed", assignees: [{ login: "Copilot" }] };
     live.alerts["code-scanning"] = [{ number: 1, state: "dismissed", assignees: [{ login: "Copilot" }] }];
@@ -459,6 +459,105 @@ test("snapshot collects review state; issue and alert resets retain existing beh
         { state: "open" }, { assignees: ["Copilot"] }, { assignees: ["presenter"] },
         { state: "open" }, { assignees: [] },
     ]);
+});
+
+test("pagination explicitly follows all pages and rejects malformed paginated responses", () => {
+    const calls = [];
+    assert.deepEqual(pages("alerts?state=dismissed&per_page=100", (command, args) => {
+        calls.push({ command, args });
+        return JSON.stringify([[{ number: 1 }], [{ number: 2 }]]);
+    }), [{ number: 1 }, { number: 2 }]);
+    assert.deepEqual(calls, [{ command: "gh",
+        args: ["api", "--paginate", "--slurp", "alerts?state=dismissed&per_page=100"] }]);
+    for (const response of [{ message: "Denied" }, [null], [{ number: 1 }]]) {
+        assert.throws(() => pages("alerts", () => JSON.stringify(response)), /Invalid paginated list response/);
+    }
+});
+
+test("snapshot explicitly collects every alert state and previews dismissed/auto-dismissed actions", () => {
+    const f = fixture();
+    const calls = [];
+    const alerts = {
+        "code-scanning": {
+            open: [{ number: 1, state: "open" }],
+            closed: [{ number: 2, state: "dismissed" }, { number: 3, state: "fixed" }],
+            dismissed: [{ number: 2, state: "dismissed" }],
+            fixed: [{ number: 3, state: "fixed" }],
+        },
+        dependabot: {
+            open: [{ number: 4, state: "open" }],
+            dismissed: [{ number: 5, state: "dismissed" }],
+            fixed: [{ number: 6, state: "fixed" }],
+            auto_dismissed: [{ number: 7, state: "auto_dismissed" }],
+        },
+    };
+    const live = snapshot((path) => {
+        calls.push(path);
+        const [endpoint, query] = path.split("?");
+        const kind = endpoint.includes("/code-scanning/") ? "code-scanning" :
+            endpoint.includes("/dependabot/") ? "dependabot" : undefined;
+        if (kind) {
+            const params = new URLSearchParams(query);
+            assert.equal(params.get("per_page"), "100");
+            assert.ok(params.has("state"));
+            const data = alerts[kind][params.get("state")];
+            // Exercise the real paginator adapter with multiple pages per explicit state.
+            return pages(path, (_, args) => {
+                assert.deepEqual(args.slice(0, 3), ["api", "--paginate", "--slurp"]);
+                return JSON.stringify([data.slice(0, 1), data.slice(1)]);
+            });
+        }
+        if (endpoint.endsWith("/branches")) return Object.entries(f.live.branches)
+            .map(([name, sha]) => ({ name, commit: { sha } }));
+        if (endpoint.endsWith("/pulls")) return f.live.prs;
+        if (endpoint.endsWith("/issues")) return f.live.issues;
+        return [];
+    });
+    live.repositoryId = f.live.repositoryId;
+    assert.deepEqual(live.alerts["code-scanning"].map((a) => a.number), [1, 2, 3]);
+    assert.deepEqual(live.alerts.dependabot.map((a) => a.number), [4, 5, 6, 7]);
+    assert.equal(calls.filter((path) => path.includes("/alerts?state=")).length, 8);
+    const plan = preview(f.state, live, sha);
+    assert.deepEqual(plan.actions.filter((a) => a.method === "PATCH").map((a) => a.path), [
+        `${prefix}/code-scanning/alerts/2`, `${prefix}/dependabot/alerts/5`, `${prefix}/dependabot/alerts/7`,
+    ]);
+    assert.ok(plan.actions[0].expected.alerts.dependabot.some((a) => a.state === "auto_dismissed"));
+    assert.ok(plan.warnings.some((warning) => /override auto-triage/.test(warning)));
+});
+
+test("alert collection deduplicates consistent observations but fails on state or assignee disagreement", () => {
+    const duplicate = { number: 1, state: "dismissed", assignees: [{ login: "z" }, { login: "a" }] };
+    const read = (path) => {
+        const state = new URLSearchParams(path.split("?")[1]).get("state");
+        return ["closed", "dismissed"].includes(state) ? [clone(duplicate), clone(duplicate)] : [];
+    };
+    const collected = collectAlerts("code-scanning", read);
+    assert.equal(collected.length, 1);
+    assert.deepEqual(collected[0].assignees, [{ login: "a" }, { login: "z" }]);
+    for (const conflicting of [
+        { number: 1, state: "fixed", assignees: [] },
+        { number: 1, state: "dismissed", assignees: [] },
+    ]) {
+        assert.throws(() => collectAlerts("code-scanning", (path) => {
+            const state = new URLSearchParams(path.split("?")[1]).get("state");
+            if (state === "closed") return [clone(conflicting)];
+            if (state === "dismissed") return [clone(duplicate)];
+            return [];
+        }), /Inconsistent code-scanning alert #1/);
+    }
+    assert.throws(() => collectAlerts("dependabot", (path) => path.includes("state=open") ?
+        [{ number: 1, state: "dismissed" }] : []), /Invalid or inconsistent/);
+});
+
+test("access failures on later alert states abort the entire snapshot rather than returning partial alerts", () => {
+    for (const kind of ["code-scanning", "dependabot"]) {
+        const failing = kind === "code-scanning" ? "fixed" : "auto_dismissed";
+        assert.throws(() => collectAlerts(kind, (path) => {
+            const state = new URLSearchParams(path.split("?")[1]).get("state");
+            if (state === failing) throw Object.assign(new Error("Forbidden"), { stderr: "HTTP 403" });
+            return state === "open" ? [{ number: 1, state: "open" }] : [];
+        }), new RegExp(`Cannot inspect alerts.*state=${failing}.*HTTP 403`));
+    }
 });
 
 test("missing scope, invalid baseline, missing seeded issue and incomplete PR state fail closed", () => {

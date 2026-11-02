@@ -25,8 +25,12 @@ function api(path, method = "GET", body) {
     return output ? JSON.parse(output) : null;
 }
 
-function pages(path) {
-    return JSON.parse(run("gh", ["api", "--paginate", "--slurp", path])).flat();
+export function pages(path, command = run) {
+    const result = JSON.parse(command("gh", ["api", "--paginate", "--slurp", path]));
+    if (!Array.isArray(result) || !result.every(Array.isArray)) {
+        throw new Error(`Invalid paginated list response at ${path}; refusing an incomplete snapshot.`);
+    }
+    return result.flat();
 }
 
 export function alertPages(path, read = pages) {
@@ -36,6 +40,37 @@ export function alertPages(path, read = pages) {
         throw new Error(`Cannot inspect alerts at ${path}; check alert access and feature availability. ` +
             `Refusing an incomplete reset: ${String(error.stderr || error.message).trim()}`, { cause: error });
     }
+}
+
+export function collectAlerts(kind, read = pages) {
+    const states = kind === "code-scanning" ? ["open", "closed", "dismissed", "fixed"] :
+        kind === "dependabot" ? ["open", "dismissed", "fixed", "auto_dismissed"] : undefined;
+    if (!states) throw new Error(`Unsupported alert kind: ${kind}`);
+    const found = new Map();
+    for (const state of states) {
+        const path = `repos/${REPO}/${kind}/alerts?state=${state}&per_page=100`;
+        const alerts = alertPages(path, read);
+        if (!Array.isArray(alerts)) throw new Error(`Invalid alert list at ${path}.`);
+        for (const alert of alerts) {
+            const allowed = kind === "code-scanning" && state === "closed" ? ["closed", "dismissed", "fixed"] : [state];
+            if (!Number.isSafeInteger(alert.number) || alert.number < 1 || !allowed.includes(alert.state) ||
+                (alert.assignees !== undefined && (!Array.isArray(alert.assignees) ||
+                    !alert.assignees.every((a) => typeof a.login === "string")))) {
+                throw new Error(`Invalid or inconsistent ${kind} alert in ${state} response; preview again after stopping writers.`);
+            }
+            const normalized = {
+                number: alert.number, state: alert.state,
+                assignees: (alert.assignees || []).map(({ login }) => ({ login }))
+                    .sort((a, b) => compareText(a.login, b.login)),
+            };
+            const prior = found.get(alert.number);
+            if (prior && !equal(prior, normalized)) {
+                throw new Error(`Inconsistent ${kind} alert #${alert.number} across observations; preview again after stopping writers.`);
+            }
+            found.set(alert.number, normalized);
+        }
+    }
+    return [...found.values()].sort(byNumber);
 }
 
 export function validateState(state) {
@@ -294,8 +329,8 @@ export function snapshot(read = pages) {
         })),
         issues: read(`${prefix}/issues?state=all&per_page=100`).filter((issue) => !issue.pull_request),
         alerts: {
-            "code-scanning": alertPages(`${prefix}/code-scanning/alerts?per_page=100`, read),
-            dependabot: alertPages(`${prefix}/dependabot/alerts?per_page=100`, read),
+            "code-scanning": collectAlerts("code-scanning", read),
+            dependabot: collectAlerts("dependabot", read),
         },
     };
 }
