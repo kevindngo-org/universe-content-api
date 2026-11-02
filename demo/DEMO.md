@@ -42,7 +42,7 @@ Each repository has its own repo-locked reset command. Run both from their own c
 
 ```sh
 node demo/remote-reset.mjs           # Preview; no changes
-node demo/remote-reset.mjs --preview-json # Machine-readable preview for the Project reset panel
+node demo/remote-reset.mjs --preview-json # Machine-readable preview suitable for a future Project-only reset panel
 node demo/remote-reset.mjs --confirm --expected-preview <fingerprint> # Apply only the reviewed plan
 node demo/remote-reset.mjs --record  # Replace the baseline after intentional changes
 ```
@@ -51,7 +51,7 @@ It mirrors virtual-universe-26's command: restores `main` to the `demo-baseline`
 
 The JSON preview prints only `{version: 1, repo, fingerprint, actions, warnings}`. Bare `--confirm` is rejected: always supply the fingerprint from the reviewed preview. The fingerprint is SHA-256 of the entire preview excluding `fingerprint`, serialized with recursively sorted object keys and preserved array order. The first `verify-state` action exposes the normalized baseline and live action-relevant state (including PR heads, reviews, and review comments); subsequent actions are deterministically ordered, including complete reopen repairs, replacement metadata, and the conditional HTTP 422 reopen fallback. A missing or changed fingerprint is rejected before any reset mutation.
 
-Stop agents and other writers before confirming. Branch creation, update, and deletion use GraphQL `updateRefs` with the repository node ID and atomic `beforeOid`/`afterOid` compare-and-swap; 40 zeroes denote an absent/deleted ref. PR writes check the expected head, using the restored recorded SHA for prepared PRs. PR/issue/alert writes are not transactional, so stopping writers remains necessary. This is a repository-wide demo reset, not a way to preserve unrelated branches or PRs inside this demo repository. Local sessions/worktrees are not changed by this script; the Project panel handles only explicitly selected demo sessions.
+Stop agents and other writers before confirming. Branch creation, update, and deletion use GraphQL `updateRefs` with the repository node ID and atomic `beforeOid`/`afterOid` compare-and-swap; 40 zeroes denote an absent/deleted ref. PR writes check the expected head, using the restored recorded SHA for prepared PRs. PR/issue/alert writes are not transactional, so stopping writers remains necessary. This is a repository-wide demo reset, not a way to preserve unrelated branches or PRs inside this demo repository. These scripts do not change local sessions or worktrees. The Project-only reset panel is not implemented or available yet; `--preview-json` provides a machine-readable interface suitable for that future panel.
 
 Immediately before each PR mutation, the script re-reads identity/head, state, title/body/base, draft, labels, reviews, review comments, and provenance discussion. Guards account for preceding planned metadata repairs, reopening/closing, and restored seed head SHAs. A new review or concurrent edit aborts instead of being overwritten. Alert writes re-read state, assignees, and update time; reopening and clearing assignees for one alert are combined into a single guarded request so the script does not erase a new assignment between its own repairs. These reads reduce races but cannot make GitHub's non-atomic APIs transactional; failure reports identify the action and warn that earlier actions may have applied.
 
