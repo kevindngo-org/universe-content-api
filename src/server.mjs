@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { loadHighlights } from "./highlights.mjs";
+import { loadHighlights, slugify } from "./highlights.mjs";
 
 function send(res, status, body) {
     res.writeHead(status, {
@@ -17,7 +17,25 @@ export function createApp({ data = loadHighlights() } = {}) {
         const url = new URL(req.url, "http://localhost");
         if (url.pathname === "/health") return send(res, 200, { ok: true });
         if (url.pathname === "/api/highlights") {
-            return send(res, 200, { event: data.event, count: data.highlights.length, highlights: data.highlights });
+            const topic = url.searchParams.get("topic");
+            const highlights = topic === null
+                ? data.highlights
+                : data.highlights.filter((highlight) => highlight.topic.toLowerCase() === topic.toLowerCase());
+            return send(res, 200, { event: data.event, count: highlights.length, highlights });
+        }
+        if (url.pathname === "/api/topics") {
+            const topics = [];
+            const topicByName = new Map();
+            for (const highlight of data.highlights) {
+                let topic = topicByName.get(highlight.topic);
+                if (!topic) {
+                    topic = { name: highlight.topic, slug: slugify(highlight.topic), count: 0 };
+                    topicByName.set(highlight.topic, topic);
+                    topics.push(topic);
+                }
+                topic.count += 1;
+            }
+            return send(res, 200, { topics });
         }
         const match = url.pathname.match(/^\/api\/highlights\/([a-z0-9-]+)$/);
         if (match) {

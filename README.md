@@ -10,7 +10,15 @@ npm test
 | Endpoint | Returns |
 | --- | --- |
 | `GET /health` | `{ "ok": true }` |
-| `GET /api/highlights` | `{ event, count, highlights: [{ id, topic, title, summary, tryIt }] }` |
+| `GET /api/highlights` | `{ event, count, highlights: [{ id, topic, title, summary, tryIt }] }`; optionally filter with `?topic=<topic name>` (case-insensitive) |
+| `GET /api/topics` | `{ topics: [{ name, slug, count }] }`, ordered by first appearance in the highlights |
 | `GET /api/highlights/:id` | One highlight, or `404` |
 
-Topic filtering is not built yet; see the open issues. Demo run of show and reset instructions: [demo/DEMO.md](demo/DEMO.md).
+For example:
+
+```sh
+curl 'http://localhost:3001/api/highlights?topic=Agentic%20software%20development'
+curl 'http://localhost:3001/api/topics'
+```
+
+An unknown topic returns the normal highlights response with `count: 0` and an empty `highlights` array. Demo run of show and reset instructions: [demo/DEMO.md](demo/DEMO.md).
